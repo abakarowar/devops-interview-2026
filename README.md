@@ -10,6 +10,8 @@
 
 ---
 
+> 🏋️ **Новое:** [Практикум — 40 задач с решениями](#practice): Linux, сети, Docker, Kubernetes, CI/CD, Terraform, Ansible, PromQL, Bash/Python и разбор инцидентов.
+
 ## 📚 Оглавление
 
 - [00. Как устроено собеседование DevOps в 2026](#m00)
@@ -28,6 +30,7 @@
 - [13. System Design для DevOps](#m13)
 - [14. Практика: troubleshooting-кейсы и live-coding](#m14)
 - [15. Soft skills, HR и переговоры](#m15)
+- [🏋️ Практикум: 40 задач с решениями](#practice)
 - [⚡ DevOps-шпаргалка на одной странице](#cheatsheet)
 - [❓ 150 вопросов с собеседований DevOps 2026](#questions)
 - [🗺️ Дорожная карта DevOps 2026](#roadmap)
@@ -1543,7 +1546,7 @@ Mitigation: выпустить вручную, задеплоить. Root cause:
    - отсутствуют requests/limits;
    - secret в `env.value` открытым текстом.
 
-Попробуй сам: возьми манифест, Dockerfile или лог и найди в нём ошибки.
+➡️ Готовые задания с решениями — в разделе [🏋️ Практикум: 40 задач](#practice).
 
 
 ---
@@ -1602,6 +1605,1220 @@ CKA, CKAD, CKS (Kubernetes); AWS SAA / DevOps Pro; HashiCorp Terraform Associate
 - Нет мониторинга, деплой руками по SSH в прод, и менять это не планируют.
 - On-call без компенсации.
 - Тестовое задание на неделю.
+
+
+---
+
+<a id="practice"></a>
+
+# 🏋️ Практикум: 40 задач с решениями
+
+> Делай руками, а не читай. Сначала попробуй решить сам, потом раскрой ▶️ решение.
+> Что нужно: Linux (или WSL2), Docker, `kind`/`minikube`, `kubectl`, `terraform`/`tofu`, `ansible`, Python 3.
+>
+> ```bash
+> kind create cluster --name interview   # локальный K8s за 1 минуту
+> ```
+
+| Блок | Задачи |
+|------|--------|
+| [🐧 Linux](#p-linux) | 1–7 |
+| [🌐 Сети](#p-net) | 8–11 |
+| [🐳 Docker](#p-docker) | 12–16 |
+| [☸️ Kubernetes](#p-k8s) | 17–25 |
+| [🔁 CI/CD](#p-ci) | 26–28 |
+| [🏗 Terraform и Ansible](#p-iac) | 29–32 |
+| [📊 Мониторинг и PromQL](#p-mon) | 33–35 |
+| [🐍 Bash и Python](#p-code) | 36–38 |
+| [🚨 Разбор инцидентов](#p-inc) | 39–40 |
+
+---
+
+<a id="p-linux"></a>
+
+## 🐧 Linux
+
+### Задача 1. Найди, кто съел диск
+Сымитируй проблему и найди её причину.
+
+```bash
+# Подготовка: процесс держит открытым удалённый файл на 500 МБ
+dd if=/dev/zero of=/tmp/big.log bs=1M count=500
+tail -f /tmp/big.log > /dev/null &
+rm /tmp/big.log
+df -h /tmp       # место не освободилось
+```
+
+<details><summary>▶️ Решение</summary>
+
+```bash
+lsof +L1 | grep big.log           # находим PID и номер FD
+# Вариант 1: перезапустить/убить процесс
+kill <PID>
+# Вариант 2: обнулить файл, не убивая процесс
+: > /proc/<PID>/fd/<FD>
+df -h /tmp                        # место вернулось
+```
+**Вывод для интервью:** `rm` удаляет только имя файла; пока процесс держит дескриптор, inode и блоки живы. Поэтому logrotate использует `copytruncate` или отправляет сигнал HUP.
+</details>
+
+### Задача 2. Кончились inode
+```bash
+mkdir /tmp/inodes && cd /tmp/inodes
+for i in $(seq 1 200000); do : > f$i; done
+```
+Как обнаружить проблему и найти каталог-виновник?
+
+<details><summary>▶️ Решение</summary>
+
+```bash
+df -i                                                    # IUse% близок к 100%
+# Каталоги с наибольшим числом файлов
+find / -xdev -printf '%h\n' 2>/dev/null | sort | uniq -c | sort -rn | head
+# Удалить быстро (rm * упадёт с "Argument list too long")
+find /tmp/inodes -type f -delete
+```
+Типичные виновники в проде: сессии PHP, кэш, очереди почты, мелкие файлы от cron.
+</details>
+
+### Задача 3. Systemd-сервис с автоперезапуском
+Напиши юнит для скрипта `/opt/app/app.sh`. Требования: запуск от пользователя `app`, перезапуск при падении не чаще 5 раз за минуту, лимит памяти 200 МБ, логи в journald.
+
+<details><summary>▶️ Решение</summary>
+
+```ini
+# /etc/systemd/system/app.service
+[Unit]
+Description=Demo app
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=app
+ExecStart=/opt/app/app.sh
+Restart=on-failure
+RestartSec=3
+MemoryMax=200M
+NoNewPrivileges=true
+ProtectSystem=strict
+PrivateTmp=true
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+```
+```bash
+useradd -r -s /usr/sbin/nologin app
+systemctl daemon-reload && systemctl enable --now app
+journalctl -u app -f
+systemctl show app -p NRestarts
+```
+</details>
+
+### Задача 4. Процесс грузит CPU — найди, что он делает
+```bash
+# Подготовка
+python3 -c "while True: pass" &
+```
+
+<details><summary>▶️ Решение</summary>
+
+```bash
+top -o %CPU                 # находим PID
+pidstat -p <PID> 1          # подтверждаем
+cat /proc/<PID>/cmdline | tr '\0' ' '
+ls -l /proc/<PID>/cwd       # рабочий каталог
+strace -p <PID> -c          # какие системные вызовы (тут почти нет — чистый счёт)
+perf top -p <PID>           # горячие функции
+# Для Java: jstack, для Python: py-spy dump --pid <PID>
+```
+Отличай: много `user` — код считает; много `sys` — системные вызовы; `wa` — ждём диск; `st` — гипервизор забирает CPU (шумный сосед).
+</details>
+
+### Задача 5. Права и SUID
+Пользователь `dev` должен иметь возможность перезапускать только `nginx` через sudo, без пароля и без root-шелла.
+
+<details><summary>▶️ Решение</summary>
+
+```bash
+visudo -f /etc/sudoers.d/dev-nginx
+# содержимое:
+dev ALL=(root) NOPASSWD: /usr/bin/systemctl restart nginx, /usr/bin/systemctl status nginx
+```
+Ловушка: нельзя разрешать `systemctl *`, `vim`, `less`, `find` — из них можно получить шелл (см. GTFOBins).
+</details>
+
+### Задача 6. Ротация логов приложения
+Логи `/var/log/myapp/*.log` растут бесконечно. Настрой хранение 14 дней, сжатие, ежедневную ротацию без перезапуска приложения.
+
+<details><summary>▶️ Решение</summary>
+
+```conf
+# /etc/logrotate.d/myapp
+/var/log/myapp/*.log {
+    daily
+    rotate 14
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+    maxsize 500M
+}
+```
+```bash
+logrotate -d /etc/logrotate.d/myapp     # dry-run
+logrotate -f /etc/logrotate.d/myapp     # принудительно
+```
+Лучше вместо `copytruncate` — `postrotate kill -HUP $(cat /run/myapp.pid)`, если приложение умеет переоткрывать файл (copytruncate может потерять пару строк).
+</details>
+
+### Задача 7. Разовая и периодическая задачи
+Запускать бэкап каждый день в 03:15, но не допустить параллельного запуска, если предыдущий ещё идёт.
+
+<details><summary>▶️ Решение</summary>
+
+```bash
+# crontab -e
+15 3 * * * /usr/bin/flock -n /run/backup.lock /opt/backup.sh >> /var/log/backup.log 2>&1
+```
+Альтернатива — systemd timer (`OnCalendar=*-*-* 03:15:00`, `Persistent=true` — запустит пропущенный запуск после перезагрузки). В K8s — `CronJob` с `concurrencyPolicy: Forbid`.
+</details>
+
+---
+
+<a id="p-net"></a>
+
+## 🌐 Сети
+
+### Задача 8. Разложи медленный HTTP-запрос по этапам
+
+<details><summary>▶️ Решение</summary>
+
+```bash
+cat > curl-format.txt <<'EOF'
+    dns:  %{time_namelookup}s
+connect:  %{time_connect}s
+    tls:  %{time_appconnect}s
+   ttfb:  %{time_starttransfer}s
+  total:  %{time_total}s
+   code:  %{http_code}
+EOF
+curl -o /dev/null -s -w @curl-format.txt https://github.com
+```
+Интерпретация: большой `dns` → проблемы резолвера; большой `connect` → сеть/далёкий сервер/SYN-очередь; большой `tls` → handshake, OCSP; большой разрыв `ttfb − tls` → медленный бэкенд.
+</details>
+
+### Задача 9. Порт не отвечает — пошаговая диагностика
+Сервис на `10.0.0.5:8080` недоступен с соседнего сервера.
+
+<details><summary>▶️ Решение</summary>
+
+```bash
+# На клиенте
+ping -c3 10.0.0.5              # L3 (ICMP может быть закрыт — это не приговор)
+nc -zv -w3 10.0.0.5 8080       # TCP: refused = хост жив, порт закрыт; timeout = фильтрует файрвол
+traceroute -T -p 8080 10.0.0.5
+# На сервере
+ss -ltnp | grep 8080           # слушает? на 127.0.0.1 или 0.0.0.0?
+iptables -S ; nft list ruleset
+tcpdump -i any -nn port 8080   # доходят ли SYN
+```
+Частая причина: приложение слушает `127.0.0.1` вместо `0.0.0.0`; в облаке — Security Group.
+</details>
+
+### Задача 10. Расчёт подсетей
+VPC `10.10.0.0/16`. Нужны 3 публичные и 3 приватные подсети по зонам, в приватных — до 4000 адресов.
+
+<details><summary>▶️ Решение</summary>
+
+| Подсеть | CIDR | Адресов |
+|---------|------|---------|
+| private-a | 10.10.0.0/20 | 4096 |
+| private-b | 10.10.16.0/20 | 4096 |
+| private-c | 10.10.32.0/20 | 4096 |
+| public-a | 10.10.48.0/24 | 256 |
+| public-b | 10.10.49.0/24 | 256 |
+| public-c | 10.10.50.0/24 | 256 |
+
+В Terraform: `cidrsubnet("10.10.0.0/16", 4, 0)` → `10.10.0.0/20`. Помни: облако резервирует 3–5 адресов в каждой подсети; EKS с VPC CNI съедает по IP на под — планируй с запасом.
+</details>
+
+### Задача 11. Проверка TLS-сертификата
+Узнай, когда истекает сертификат сайта, и напиши проверку для cron, которая предупредит за 14 дней.
+
+<details><summary>▶️ Решение</summary>
+
+```bash
+host=github.com
+openssl s_client -connect $host:443 -servername $host </dev/null 2>/dev/null \
+  | openssl x509 -noout -dates -subject -issuer
+
+# Проверка: вернёт ненулевой код, если истекает в ближайшие 14 дней
+openssl s_client -connect $host:443 -servername $host </dev/null 2>/dev/null \
+  | openssl x509 -noout -checkend $((14*86400)) || echo "ALERT: $host сертификат скоро истекает"
+```
+В проде — blackbox_exporter и алерт `probe_ssl_earliest_cert_expiry - time() < 14*86400`.
+</details>
+
+---
+
+<a id="p-docker"></a>
+
+## 🐳 Docker
+
+### Задача 12. Исправь плохой Dockerfile
+```dockerfile
+FROM python:latest
+ADD . /app
+WORKDIR /app
+RUN apt-get update
+RUN apt-get install -y gcc
+RUN pip install -r requirements.txt
+ENV API_KEY=sk-123456
+EXPOSE 8000
+CMD python app.py
+```
+
+<details><summary>▶️ Решение</summary>
+
+Проблемы: `latest`; `ADD .` до зависимостей ломает кэш; `update` и `install` в разных слоях; gcc в финальном образе; секрет в ENV навсегда в слое; root; shell-форма CMD (сигналы не доходят); нет `.dockerignore`.
+
+```dockerfile
+# syntax=docker/dockerfile:1
+FROM python:3.12-slim AS build
+WORKDIR /app
+RUN apt-get update && apt-get install -y --no-install-recommends gcc \
+    && rm -rf /var/lib/apt/lists/*
+COPY requirements.txt .
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --prefix=/install -r requirements.txt
+
+FROM python:3.12-slim
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
+RUN useradd --create-home --uid 10001 app
+WORKDIR /app
+COPY --from=build /install /usr/local
+COPY --chown=app:app . .
+USER app
+EXPOSE 8000
+CMD ["python", "app.py"]
+```
+</details>
+
+### Задача 13. Почему контейнер останавливается 10 секунд?
+```bash
+docker run -d --name slow alpine sh -c "sleep 3600"
+time docker stop slow   # ~10 секунд
+```
+
+<details><summary>▶️ Решение</summary>
+
+PID 1 внутри — `sh`, у PID 1 нет обработчиков сигналов по умолчанию, SIGTERM игнорируется → через 10 с Docker шлёт SIGKILL.
+
+```bash
+docker run -d --init --name fast alpine sleep 3600   # tini как PID 1
+time docker stop fast                               # мгновенно
+```
+В своём образе: exec-форма `CMD ["app"]`, `exec "$@"` в entrypoint-скриптах, обработка SIGTERM в коде, либо `tini`/`dumb-init`.
+</details>
+
+### Задача 14. Ограничь ресурсы и поймай OOM
+<details><summary>▶️ Решение</summary>
+
+```bash
+docker run --name oom -m 64m python:3.12-slim \
+  python -c "a = bytearray(200*1024*1024)"
+docker inspect oom --format '{{.State.OOMKilled}} {{.State.ExitCode}}'   # true 137
+docker stats --no-stream
+```
+Exit 137 = 128 + 9 (SIGKILL). Тот же механизм — `OOMKilled` в Kubernetes.
+</details>
+
+### Задача 15. docker compose: приложение + PostgreSQL + Redis
+Подними стек, где приложение стартует только после того, как БД реально готова.
+
+<details><summary>▶️ Решение</summary>
+
+```yaml
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_PASSWORD: example
+    volumes: [pgdata:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      retries: 10
+  redis:
+    image: redis:7-alpine
+  app:
+    image: ghcr.io/example/app:1.0
+    environment:
+      DATABASE_URL: postgres://postgres:example@db:5432/postgres
+      REDIS_URL: redis://redis:6379
+    ports: ["8080:8080"]
+    depends_on:
+      db: { condition: service_healthy }
+      redis: { condition: service_started }
+    restart: unless-stopped
+volumes:
+  pgdata:
+```
+Ключевое — `depends_on.condition: service_healthy`; без healthcheck `depends_on` ждёт только старта контейнера, а не готовности БД.
+</details>
+
+### Задача 16. Просканируй образ и подпиши его
+<details><summary>▶️ Решение</summary>
+
+```bash
+trivy image --severity HIGH,CRITICAL --exit-code 1 nginx:1.25    # в CI упадёт при находках
+syft nginx:1.27 -o cyclonedx-json > sbom.json                    # SBOM
+cosign generate-key-pair
+cosign sign --key cosign.key registry.example.com/app@sha256:<digest>
+cosign verify --key cosign.pub registry.example.com/app@sha256:<digest>
+```
+Подписывай **digest**, а не тег — тег можно перезаписать.
+</details>
+
+---
+
+<a id="p-k8s"></a>
+
+## ☸️ Kubernetes
+
+### Задача 17. Найди 10 ошибок в манифесте
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: web
+  template:
+    metadata:
+      labels:
+        app: website
+    spec:
+      containers:
+        - name: web
+          image: nginx:latest
+          ports:
+            - containerPort: 80
+          env:
+            - name: DB_PASSWORD
+              value: "SuperSecret123"
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            periodSeconds: 1
+            failureThreshold: 1
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: web
+spec:
+  selector:
+    app: web
+  ports:
+    - port: 80
+      targetPort: 8080
+```
+
+<details><summary>▶️ Решение</summary>
+
+1. Лейблы шаблона `website` ≠ selector `web` — API отклонит Deployment.
+2. `replicas: 1` — нет отказоустойчивости.
+3. `nginx:latest` — невоспроизводимо.
+4. Пароль открытым текстом → Secret / ESO.
+5. Liveness на порт 8080, а контейнер слушает 80; `/healthz` у nginx нет.
+6. Агрессивная liveness (1 с / 1 попытка) → рестарты по кругу.
+7. Нет readinessProbe.
+8. Нет resources → QoS BestEffort.
+9. Service `targetPort: 8080` ≠ `containerPort: 80`.
+10. Нет securityContext (root, writable FS).
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+spec:
+  replicas: 3
+  selector:
+    matchLabels: { app: web }
+  strategy:
+    rollingUpdate: { maxSurge: 1, maxUnavailable: 0 }
+  template:
+    metadata:
+      labels: { app: web }
+    spec:
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector: { matchLabels: { app: web } }
+      securityContext: { runAsNonRoot: true, seccompProfile: { type: RuntimeDefault } }
+      containers:
+        - name: web
+          image: nginxinc/nginx-unprivileged:1.27-alpine
+          ports: [{ containerPort: 8080 }]
+          env:
+            - name: DB_PASSWORD
+              valueFrom: { secretKeyRef: { name: web-db, key: password } }
+          readinessProbe:
+            httpGet: { path: /, port: 8080 }
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: { path: /, port: 8080 }
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            failureThreshold: 3
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits: { memory: 64Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: { drop: [ALL] }
+          lifecycle:
+            preStop: { exec: { command: ["sleep", "5"] } }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: web
+spec:
+  selector: { app: web }
+  ports: [{ port: 80, targetPort: 8080 }]
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: web
+spec:
+  minAvailable: 2
+  selector: { matchLabels: { app: web } }
+```
+</details>
+
+### Задача 18. Почини CrashLoopBackOff
+```bash
+kubectl create deployment crash --image=busybox -- sh -c "echo starting; exit 1"
+kubectl get pods -w
+```
+
+<details><summary>▶️ Решение</summary>
+
+```bash
+kubectl describe pod -l app=crash      # Last State: Terminated, Exit Code: 1, Back-off restarting
+kubectl logs -l app=crash --previous   # "starting"
+kubectl get events --sort-by=.lastTimestamp | tail
+# Исправляем команду
+kubectl patch deploy crash --type=json \
+  -p='[{"op":"replace","path":"/spec/template/spec/containers/0/command","value":["sh","-c","echo ok; sleep 3600"]}]'
+kubectl rollout status deploy/crash
+```
+Расшифровка exit code: 1 — ошибка приложения; 126/127 — нет прав / команда не найдена; 137 — SIGKILL/OOM; 143 — SIGTERM.
+</details>
+
+### Задача 19. Под висит в Pending
+```bash
+kubectl run big --image=nginx --overrides='{"spec":{"containers":[{"name":"big","image":"nginx","resources":{"requests":{"cpu":"100","memory":"1Ti"}}}]}}'
+```
+
+<details><summary>▶️ Решение</summary>
+
+```bash
+kubectl describe pod big | sed -n '/Events/,$p'
+# 0/1 nodes are available: 1 Insufficient cpu, 1 Insufficient memory
+kubectl describe nodes | grep -A5 "Allocated resources"
+kubectl delete pod big
+```
+Чек-лист Pending: ресурсы → taints/tolerations → nodeSelector/affinity → PVC не связан (StorageClass, зона) → ResourceQuota → лимит подов на ноде (110) → нет IP в подсети.
+</details>
+
+### Задача 20. Service не отвечает
+```bash
+kubectl create deployment api --image=nginx --replicas=2
+kubectl expose deployment api --port=80 --target-port=8080
+kubectl run tmp --rm -it --image=curlimages/curl -- curl -m3 http://api
+```
+
+<details><summary>▶️ Решение</summary>
+
+```bash
+kubectl get endpointslices -l kubernetes.io/service-name=api   # endpoints есть, но порт 8080
+kubectl get svc api -o yaml | grep -A3 ports
+kubectl get pods -l app=api -o jsonpath='{..containerPort}'      # 80
+kubectl patch svc api -p '{"spec":{"ports":[{"port":80,"targetPort":80}]}}'
+```
+Порядок проверки: селектор совпадает с лейблами → endpoints не пустые → `targetPort` верный → поды Ready → NetworkPolicy → DNS (`nslookup api` из пода).
+</details>
+
+### Задача 21. Zero-downtime rolling update и откат
+<details><summary>▶️ Решение</summary>
+
+```bash
+kubectl create deployment web --image=nginx:1.26 --replicas=4
+kubectl set image deploy/web nginx=nginx:1.27
+kubectl rollout status deploy/web
+kubectl rollout history deploy/web
+kubectl set image deploy/web nginx=nginx:does-not-exist   # сломали
+kubectl rollout status deploy/web --timeout=60s           # зависнет
+kubectl rollout undo deploy/web
+kubectl annotate deploy/web kubernetes.io/change-cause="rollback after bad image"
+```
+Благодаря `maxUnavailable` старые поды не удаляются, пока новые не стали Ready, поэтому сломанный образ не уронил сервис.
+</details>
+
+### Задача 22. ConfigMap, Secret и обновление конфигурации
+Прокинь конфиг файлом и секрет переменной. Как сделать так, чтобы поды перезапустились при изменении ConfigMap?
+
+<details><summary>▶️ Решение</summary>
+
+```bash
+kubectl create configmap app-cfg --from-literal=LOG_LEVEL=info --from-file=app.yaml
+kubectl create secret generic app-sec --from-literal=DB_PASSWORD='s3cr3t'
+```
+```yaml
+spec:
+  template:
+    metadata:
+      annotations:
+        checksum/config: "{{ include (print $.Template.BasePath \"/configmap.yaml\") . | sha256sum }}"  # Helm
+    spec:
+      containers:
+        - name: app
+          envFrom: [{ secretRef: { name: app-sec } }]
+          volumeMounts: [{ name: cfg, mountPath: /etc/app }]
+      volumes:
+        - name: cfg
+          configMap: { name: app-cfg }
+```
+Факты: файлы из смонтированного ConfigMap обновляются сами (до ~1 мин), env — нет (нужен рестарт). Способы рестарта: хеш-аннотация в Helm, `kubectl rollout restart`, Reloader (stakater). При `subPath` файл не обновляется.
+</details>
+
+### Задача 23. HPA под нагрузкой
+<details><summary>▶️ Решение</summary>
+
+```bash
+# metrics-server для kind
+kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
+kubectl patch deploy metrics-server -n kube-system --type=json \
+  -p='[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--kubelet-insecure-tls"}]'
+
+kubectl create deployment php --image=registry.k8s.io/hpa-example
+kubectl set resources deploy php --requests=cpu=200m
+kubectl expose deploy php --port=80
+kubectl autoscale deploy php --cpu-percent=50 --min=1 --max=10
+kubectl run load --rm -it --image=busybox -- sh -c "while true; do wget -q -O- http://php; done"
+kubectl get hpa -w
+```
+Без `requests.cpu` HPA по CPU не работает (процент считается от requests).
+</details>
+
+### Задача 24. NetworkPolicy: default deny
+Разреши трафик к `db` только из подов `app=api` на порт 5432.
+
+<details><summary>▶️ Решение</summary>
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: default-deny, namespace: prod }
+spec:
+  podSelector: {}
+  policyTypes: [Ingress]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: db-from-api, namespace: prod }
+spec:
+  podSelector: { matchLabels: { app: db } }
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector: { matchLabels: { app: api } }
+      ports:
+        - { protocol: TCP, port: 5432 }
+```
+Ловушки: в kind по умолчанию CNI (kindnet) не применяет NetworkPolicy — нужен Calico/Cilium. Если делаешь default deny для **Egress**, не забудь разрешить DNS (UDP/TCP 53 к kube-dns).
+</details>
+
+### Задача 25. RBAC для CI-бота
+ServiceAccount `deployer` в namespace `staging` должен уметь обновлять Deployment'ы и смотреть поды, но не читать Secret'ы.
+
+<details><summary>▶️ Решение</summary>
+
+```yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata: { name: deployer, namespace: staging }
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata: { name: deployer, namespace: staging }
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list", "watch", "patch", "update"]
+  - apiGroups: [""]
+    resources: ["pods", "pods/log"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata: { name: deployer, namespace: staging }
+subjects: [{ kind: ServiceAccount, name: deployer, namespace: staging }]
+roleRef: { kind: Role, name: deployer, apiGroup: rbac.authorization.k8s.io }
+```
+```bash
+kubectl auth can-i patch deploy -n staging --as=system:serviceaccount:staging:deployer   # yes
+kubectl auth can-i get secrets -n staging --as=system:serviceaccount:staging:deployer   # no
+kubectl create token deployer -n staging --duration=1h                                   # короткоживущий токен
+```
+</details>
+
+---
+
+<a id="p-ci"></a>
+
+## 🔁 CI/CD
+
+### Задача 26. Полный пайплайн GitHub Actions
+Тесты → сборка образа → скан Trivy → push в GHCR только из `main` → деплой через обновление тега в репозитории конфигурации (GitOps).
+
+<details><summary>▶️ Решение</summary>
+
+```yaml
+name: ci
+on:
+  push: { branches: [main] }
+  pull_request:
+concurrency: { group: ci-${{ github.ref }}, cancel-in-progress: true }
+permissions: { contents: read, packages: write }
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12", cache: pip }
+      - run: pip install -r requirements.txt && pytest -q
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    outputs: { image: ${{ steps.meta.outputs.image }} }
+    steps:
+      - uses: actions/checkout@v4
+      - id: meta
+        run: echo "image=ghcr.io/${GITHUB_REPOSITORY,,}:${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with: { registry: ghcr.io, username: ${{ github.actor }}, password: ${{ secrets.GITHUB_TOKEN }} }
+      - uses: docker/build-push-action@v6
+        with:
+          load: true
+          tags: ${{ steps.meta.outputs.image }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - uses: aquasecurity/trivy-action@master
+        with: { image-ref: "${{ steps.meta.outputs.image }}", severity: "CRITICAL,HIGH", exit-code: "1", ignore-unfixed: true }
+      - if: github.ref == 'refs/heads/main'
+        run: docker push ${{ steps.meta.outputs.image }}
+
+  deploy:
+    if: github.ref == 'refs/heads/main'
+    needs: build
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+        with: { repository: my-org/gitops, token: ${{ secrets.GITOPS_TOKEN }} }
+      - run: |
+          yq -i '.image.tag = "${{ github.sha }}"' apps/api/values-prod.yaml
+          git config user.name ci-bot && git config user.email ci@example.com
+          git commit -am "api: deploy ${GITHUB_SHA::7}" && git push
+```
+На собеседовании объясни: `concurrency` отменяет устаревшие запуски, `environment` даёт ручной approve, Argo CD сам подтянет изменение из gitops-репо. В проде пинни actions по SHA.
+</details>
+
+### Задача 27. GitLab CI: шаблоны и окружения
+Вынеси общий шаблон деплоя и используй его для stage (автоматически) и prod (вручную, только по тегу).
+
+<details><summary>▶️ Решение</summary>
+
+```yaml
+stages: [build, deploy]
+
+.deploy_tpl:
+  stage: deploy
+  image: alpine/helm:3.16.2
+  script:
+    - helm upgrade --install api ./chart -n $KUBE_NS
+        --set image.tag=$CI_COMMIT_SHORT_SHA --atomic --wait --timeout 5m
+
+build:
+  stage: build
+  image: docker:27
+  services: [docker:27-dind]
+  script:
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+    - docker build -t $CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA .
+    - docker push $CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA
+
+deploy_stage:
+  extends: .deploy_tpl
+  variables: { KUBE_NS: staging }
+  environment: { name: staging, url: https://stage.example.com }
+  rules: [{ if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH }]
+
+deploy_prod:
+  extends: .deploy_tpl
+  variables: { KUBE_NS: production }
+  environment: { name: production, url: https://example.com }
+  rules: [{ if: $CI_COMMIT_TAG, when: manual }]
+```
+`--atomic` откатит релиз Helm, если поды не стали Ready.
+</details>
+
+### Задача 28. Argo CD Application
+<details><summary>▶️ Решение</summary>
+
+```yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: api-prod
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/my-org/gitops.git
+    targetRevision: main
+    path: apps/api
+    helm: { valueFiles: [values-prod.yaml] }
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: production
+  syncPolicy:
+    automated: { prune: true, selfHeal: true }
+    syncOptions: [CreateNamespace=true]
+```
+`selfHeal` вернёт ручные правки в кластере к состоянию из Git; `prune` удалит ресурсы, которых больше нет в Git. Для множества кластеров/сервисов — `ApplicationSet`.
+</details>
+
+---
+
+<a id="p-iac"></a>
+
+## 🏗 Terraform и Ansible
+
+### Задача 29. Модуль VPC с подсетями по зонам
+<details><summary>▶️ Решение</summary>
+
+```hcl
+# modules/vpc/variables.tf
+variable "name" { type = string }
+variable "cidr" { type = string }
+variable "azs"  { type = list(string) }
+
+# modules/vpc/main.tf
+resource "aws_vpc" "this" {
+  cidr_block           = var.cidr
+  enable_dns_hostnames = true
+  tags                 = { Name = var.name }
+}
+
+resource "aws_subnet" "private" {
+  for_each          = { for i, az in var.azs : az => i }
+  vpc_id            = aws_vpc.this.id
+  availability_zone = each.key
+  cidr_block        = cidrsubnet(var.cidr, 4, each.value)
+  tags              = { Name = "${var.name}-private-${each.key}" }
+}
+
+resource "aws_subnet" "public" {
+  for_each                = { for i, az in var.azs : az => i }
+  vpc_id                  = aws_vpc.this.id
+  availability_zone       = each.key
+  cidr_block              = cidrsubnet(var.cidr, 8, 48 + each.value)
+  map_public_ip_on_launch = true
+  tags                    = { Name = "${var.name}-public-${each.key}" }
+}
+
+# modules/vpc/outputs.tf
+output "private_subnet_ids" { value = [for s in aws_subnet.private : s.id] }
+
+# envs/prod/main.tf
+module "vpc" {
+  source = "../../modules/vpc"
+  name   = "prod"
+  cidr   = "10.10.0.0/16"
+  azs    = ["eu-central-1a", "eu-central-1b", "eu-central-1c"]
+}
+```
+Почему `for_each` по зоне: удаление зоны из списка не пересоздаст остальные подсети (с `count` индексы бы сдвинулись).
+</details>
+
+### Задача 30. Рефакторинг без пересоздания и импорт
+1) Ресурс `aws_s3_bucket.logs` переименовали в `aws_s3_bucket.audit_logs`. 2) Бакет `legacy-data` создан руками — заведи его под Terraform.
+
+<details><summary>▶️ Решение</summary>
+
+```hcl
+moved {
+  from = aws_s3_bucket.logs
+  to   = aws_s3_bucket.audit_logs
+}
+
+import {
+  to = aws_s3_bucket.legacy
+  id = "legacy-data"
+}
+
+resource "aws_s3_bucket" "legacy" {
+  bucket = "legacy-data"
+  lifecycle { prevent_destroy = true }
+}
+```
+```bash
+terraform plan -generate-config-out=generated.tf   # TF 1.5+ сгенерирует код для import
+terraform plan                                     # 0 to add, 0 to destroy — цель
+```
+</details>
+
+### Задача 31. Remote state с блокировкой
+<details><summary>▶️ Решение</summary>
+
+```hcl
+terraform {
+  backend "s3" {
+    bucket       = "acme-tf-state"
+    key          = "prod/network/terraform.tfstate"
+    region       = "eu-central-1"
+    encrypt      = true
+    use_lockfile = true      # TF 1.10+: блокировка через S3, DynamoDB не нужен
+  }
+}
+```
+Бакет state: версионирование ON, шифрование KMS, блок публичного доступа, доступ только CI-роли. Чтобы читать outputs другого стейта — `data "terraform_remote_state"` (а лучше — передавать значения через SSM/параметры, чтобы не связывать стейты жёстко).
+</details>
+
+### Задача 32. Ansible-роль: nginx + пользователь + firewall
+<details><summary>▶️ Решение</summary>
+
+```yaml
+# inventory.ini
+[web]
+10.0.0.11
+10.0.0.12
+
+# site.yml
+- hosts: web
+  become: true
+  vars:
+    deploy_user: deploy
+    deploy_key: "{{ lookup('file', '~/.ssh/id_ed25519.pub') }}"
+  tasks:
+    - name: Пользователь для деплоя
+      ansible.builtin.user: { name: "{{ deploy_user }}", shell: /bin/bash, groups: sudo, append: true }
+
+    - name: SSH-ключ
+      ansible.posix.authorized_key: { user: "{{ deploy_user }}", key: "{{ deploy_key }}" }
+
+    - name: Запрет входа по паролю
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^#?PasswordAuthentication'
+        line: 'PasswordAuthentication no'
+        validate: 'sshd -t -f %s'
+      notify: restart ssh
+
+    - name: Пакеты
+      ansible.builtin.apt: { name: [nginx, ufw], state: present, update_cache: true, cache_valid_time: 3600 }
+
+    - name: Firewall
+      community.general.ufw: { rule: allow, port: "{{ item }}", proto: tcp }
+      loop: ["22", "80", "443"]
+
+    - name: Включить ufw
+      community.general.ufw: { state: enabled, policy: deny }
+
+  handlers:
+    - name: restart ssh
+      ansible.builtin.service: { name: ssh, state: restarted }
+```
+```bash
+ansible-playbook -i inventory.ini site.yml --check --diff   # dry-run
+ansible-playbook -i inventory.ini site.yml                  # второй запуск должен дать changed=0
+```
+`validate: sshd -t` не даст записать сломанный конфиг и потерять доступ к серверу.
+</details>
+
+---
+
+<a id="p-mon"></a>
+
+## 📊 Мониторинг и PromQL
+
+### Задача 33. Мини-стенд Prometheus + Grafana
+<details><summary>▶️ Решение</summary>
+
+```yaml
+# docker-compose.yml
+services:
+  node-exporter:
+    image: prom/node-exporter:v1.8.2
+  prometheus:
+    image: prom/prometheus:v3.0.1
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./alerts.yml:/etc/prometheus/alerts.yml:ro
+    ports: ["9090:9090"]
+  grafana:
+    image: grafana/grafana:11.3.0
+    environment: { GF_SECURITY_ADMIN_PASSWORD: admin }
+    ports: ["3000:3000"]
+```
+```yaml
+# prometheus.yml
+global: { scrape_interval: 15s }
+rule_files: [/etc/prometheus/alerts.yml]
+scrape_configs:
+  - job_name: node
+    static_configs: [{ targets: ["node-exporter:9100"] }]
+```
+```yaml
+# alerts.yml
+groups:
+  - name: node
+    rules:
+      - alert: TargetDown
+        expr: up == 0
+        for: 1m
+        labels: { severity: critical }
+      - alert: HighCPU
+        expr: 100 - avg by (instance) (rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100 > 85
+        for: 10m
+        labels: { severity: warning }
+      - alert: DiskWillFillIn4h
+        expr: predict_linear(node_filesystem_avail_bytes{fstype!~"tmpfs|overlay"}[6h], 4*3600) < 0
+        for: 30m
+        labels: { severity: warning }
+```
+Дальше: в Grafana добавь datasource `http://prometheus:9090`, импортируй дашборд **Node Exporter Full (ID 1860)**, нагрузи CPU (`docker run --rm alpine sh -c "yes > /dev/null"`) и посмотри алерт на `/alerts`.
+</details>
+
+### Задача 34. Напиши 8 запросов PromQL
+1. Использование памяти ноды в %. 2. Использование диска `/` в %. 3. RPS по сервисам. 4. Доля 5xx. 5. p95 latency по эндпоинтам. 6. Поды, рестартовавшие за час. 7. Поды с CPU throttling > 25%. 8. Использование памяти пода относительно лимита.
+
+<details><summary>▶️ Решение</summary>
+
+```promql
+# 1
+(1 - node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes) * 100
+# 2
+(1 - node_filesystem_avail_bytes{mountpoint="/"} / node_filesystem_size_bytes{mountpoint="/"}) * 100
+# 3
+sum by (service) (rate(http_requests_total[5m]))
+# 4
+sum(rate(http_requests_total{code=~"5.."}[5m])) / sum(rate(http_requests_total[5m]))
+# 5
+histogram_quantile(0.95, sum by (le, handler) (rate(http_request_duration_seconds_bucket[5m])))
+# 6
+increase(kube_pod_container_status_restarts_total[1h]) > 0
+# 7
+sum by (pod) (rate(container_cpu_cfs_throttled_periods_total[5m]))
+  / sum by (pod) (rate(container_cpu_cfs_periods_total[5m])) > 0.25
+# 8
+sum by (pod) (container_memory_working_set_bytes{container!=""})
+  / sum by (pod) (kube_pod_container_resource_limits{resource="memory"})
+```
+`working_set_bytes` — то, на что смотрит OOM killer, а не `usage_bytes` (включает кэш).
+</details>
+
+### Задача 35. SLO-алерт по burn rate
+SLO: 99.9% успешных запросов за 30 дней. Напиши быстрый и медленный алерты.
+
+<details><summary>▶️ Решение</summary>
+
+```yaml
+groups:
+  - name: slo-api
+    rules:
+      - record: slo:error_ratio:rate5m
+        expr: sum(rate(http_requests_total{job="api",code=~"5.."}[5m])) / sum(rate(http_requests_total{job="api"}[5m]))
+      - record: slo:error_ratio:rate1h
+        expr: sum(rate(http_requests_total{job="api",code=~"5.."}[1h])) / sum(rate(http_requests_total{job="api"}[1h]))
+      - record: slo:error_ratio:rate30m
+        expr: sum(rate(http_requests_total{job="api",code=~"5.."}[30m])) / sum(rate(http_requests_total{job="api"}[30m]))
+      - record: slo:error_ratio:rate6h
+        expr: sum(rate(http_requests_total{job="api",code=~"5.."}[6h])) / sum(rate(http_requests_total{job="api"}[6h]))
+
+      - alert: ApiErrorBudgetFastBurn     # 2% бюджета за 1 час
+        expr: slo:error_ratio:rate1h > (14.4 * 0.001) and slo:error_ratio:rate5m > (14.4 * 0.001)
+        labels: { severity: page }
+      - alert: ApiErrorBudgetSlowBurn     # 5% бюджета за 6 часов
+        expr: slo:error_ratio:rate6h > (6 * 0.001) and slo:error_ratio:rate30m > (6 * 0.001)
+        labels: { severity: page }
+```
+Короткое окно (5m/30m) нужно, чтобы алерт быстро **погас** после исправления. Генераторы правил: Sloth, Pyrra.
+</details>
+
+---
+
+<a id="p-code"></a>
+
+## 🐍 Bash и Python
+
+### Задача 36. Анализ лога nginx
+Сгенерируй лог и ответь: топ-5 IP, распределение кодов, топ-5 URL с 5xx, запросы в минуту, доля 5xx.
+
+```bash
+python3 - > access.log <<'EOF'
+import random
+from datetime import datetime, timedelta
+ips = [f"10.0.{random.randint(0,3)}.{random.randint(1,50)}" for _ in range(40)]
+paths = ["/", "/api/users", "/api/orders", "/login", "/static/app.js", "/health"]
+codes = [200]*80 + [301]*5 + [404]*7 + [500]*4 + [502]*2 + [503]*2
+t0 = datetime(2026, 10, 1, 12)
+for i in range(5000):
+    ts = (t0 + timedelta(seconds=i//20)).strftime("%d/%b/%Y:%H:%M:%S +0300")
+    print(f'{random.choice(ips)} - - [{ts}] "GET {random.choice(paths)} HTTP/1.1" {random.choice(codes)} {random.randint(200,5000)} "-" "curl/8.5.0"')
+EOF
+```
+
+<details><summary>▶️ Решение</summary>
+
+```bash
+awk '{print $1}' access.log | sort | uniq -c | sort -rn | head -5
+awk '{print $9}' access.log | sort | uniq -c | sort -rn
+awk '$9 ~ /^5/ {print $7}' access.log | sort | uniq -c | sort -rn | head -5
+awk '{print substr($4, 2, 17)}' access.log | uniq -c
+awk '{t++} $9 ~ /^5/ {e++} END {printf "5xx: %.2f%%\n", e/t*100}' access.log
+```
+</details>
+
+### Задача 37. Скрипт бэкапа PostgreSQL с ротацией и проверкой
+<details><summary>▶️ Решение</summary>
+
+```bash
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+DB=${DB:-app}
+DIR=${BACKUP_DIR:-/backup}
+KEEP=${KEEP:-7}
+TS=$(date +%F_%H%M)
+FILE="$DIR/${DB}_${TS}.sql.gz"
+
+log() { echo "$(date -Is) $*"; }
+trap 'log "ОШИБКА на строке $LINENO"; rm -f "$FILE"; exit 1' ERR
+
+exec 9>/run/pg-backup.lock
+flock -n 9 || { log "Бэкап уже идёт"; exit 0; }
+
+mkdir -p "$DIR"
+log "Старт бэкапа $DB"
+pg_dump --no-owner "$DB" | gzip -9 > "$FILE"
+
+gzip -t "$FILE"                                      # архив не битый
+[[ $(stat -c %s "$FILE") -gt 1024 ]] || { log "Слишком маленький файл"; exit 1; }
+
+aws s3 cp "$FILE" "s3://acme-backups/postgres/" --storage-class STANDARD_IA
+
+ls -1t "$DIR"/${DB}_*.sql.gz | tail -n +$((KEEP+1)) | xargs -r rm --
+log "Готово: $FILE ($(du -h "$FILE" | cut -f1))"
+```
+Что сказать на интервью: `pg_dump` подходит для небольших БД; для больших — физические бэкапы и PITR (pgBackRest, WAL-G). Бэкап без регулярного тестового восстановления — не бэкап.
+</details>
+
+### Задача 38. Python: отчёт о проблемных подах
+Выведи все поды, которые не Running/Succeeded или рестартовали больше 3 раз, с причиной, в виде таблицы.
+
+<details><summary>▶️ Решение</summary>
+
+```python
+#!/usr/bin/env python3
+# pip install kubernetes
+from kubernetes import client, config
+
+config.load_kube_config()          # внутри кластера: config.load_incluster_config()
+v1 = client.CoreV1Api()
+
+rows = []
+for p in v1.list_pod_for_all_namespaces().items:
+    for cs in p.status.container_statuses or []:
+        reason = ""
+        if cs.state.waiting:
+            reason = cs.state.waiting.reason
+        elif cs.last_state.terminated:
+            reason = f"last: {cs.last_state.terminated.reason}"
+        if p.status.phase not in ("Running", "Succeeded") or cs.restart_count > 3 or (cs.state.waiting and reason):
+            rows.append((p.metadata.namespace, p.metadata.name, p.status.phase, cs.restart_count, reason))
+
+print(f"{'NAMESPACE':<15}{'POD':<45}{'PHASE':<10}{'RESTARTS':<10}REASON")
+for r in sorted(rows, key=lambda r: -r[3]):
+    print(f"{r[0]:<15}{r[1]:<45}{r[2]:<10}{r[3]:<10}{r[4]}")
+```
+Улучшения: аргументы через `argparse`, вывод в JSON, отправка в Telegram/Slack, запуск как CronJob с ServiceAccount только на `list pods`.
+</details>
+
+---
+
+<a id="p-inc"></a>
+
+## 🚨 Разбор инцидентов (ролевая игра)
+
+> Попроси друга сыграть интервьюера: он описывает ситуацию и отвечает на твои вопросы, ты называешь действия.
+
+### Задача 39. «В пятницу в 18:00 после релиза выросли 5xx до 30%»
+
+<details><summary>▶️ Эталонный ход мысли</summary>
+
+1. **Объявить инцидент**, назначить себя/кого-то Incident Commander, открыть канал, сообщить статус.
+2. **Связать с изменением:** релиз 10 минут назад → самая вероятная причина.
+3. **Mitigate first:** немедленный откат (`kubectl rollout undo` / `git revert` в GitOps / выключить feature flag). Не дебажить в проде полчаса при 30% ошибок.
+4. **Проверить восстановление:** 5xx вернулись к базовому уровню, latency в норме.
+5. **Root cause после:** логи и трейсы упавших запросов, diff релиза, миграции БД, новые зависимости/конфиги.
+6. **Postmortem:** почему canary/тесты не поймали? Action items: canary с автоматическим анализом (Argo Rollouts + Prometheus), контрактные тесты, запрет релизов в пятницу вечером без дежурного.
+</details>
+
+### Задача 40. «Ночью база данных стала отвечать в 10 раз медленнее, релизов не было»
+
+<details><summary>▶️ Эталонный ход мысли</summary>
+
+1. **Масштаб:** все запросы или часть? Все сервисы или один? С какого времени (наложить на графики)?
+2. **Что изменилось без релиза:** cron/батч-задачи, бэкап, `VACUUM`/`ANALYZE`, рост данных, всплеск трафика (бот, маркетинговая рассылка), облачное обслуживание, исчерпание burst-кредитов диска (gp2/t-инстансы).
+3. **Ресурсы БД:** CPU, IOPS/latency диска, память (cache hit ratio), число соединений, репликационный лаг, блокировки.
+4. **Запросы:** `pg_stat_activity` (долгие и ждущие), `pg_stat_statements` (топ по total time), `pg_locks`; план запроса изменился (`EXPLAIN ANALYZE`) — статистика устарела.
+5. **Mitigate:** убить зависший тяжёлый запрос/транзакцию, остановить батч, увеличить пул/инстанс, переключить чтение на реплику.
+6. **Предотвращение:** алерты на slow queries и соединения, `statement_timeout`, батчи в окно с низкой нагрузкой, connection pooler (PgBouncer), capacity planning.
+</details>
+
+---
+
+### ✅ Чек-лист готовности к практике
+
+- [ ] Решил все 40 задач руками хотя бы один раз
+- [ ] Могу за 10 минут написать Deployment + Service + Ingress с probes и ресурсами по памяти
+- [ ] Могу за 10 минут написать multi-stage Dockerfile
+- [ ] Могу за 15 минут написать пайплайн CI с тестами, сборкой и деплоем
+- [ ] Знаю наизусть 5 запросов PromQL
+- [ ] Могу рассказать порядок действий при любом инциденте из этого раздела
 
 
 ---
