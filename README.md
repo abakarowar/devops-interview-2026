@@ -10,7 +10,9 @@
 
 ---
 
-> 🏋️ **Новое:** [Практикум — 40 задач с решениями](#practice): Linux, сети, Docker, Kubernetes, CI/CD, Terraform, Ansible, PromQL, Bash/Python и разбор инцидентов.
+> 🏋️ **Новое:** [Практикум — 55 задач с решениями](#practice): Linux, сети, Git, Docker, Kubernetes, CI/CD, Terraform, Ansible, облака и FinOps, PromQL, DevSecOps, SRE, Bash/Python, System Design и разбор инцидентов.
+>
+> 🧪 В конце каждого модуля 01–13 — блок **«🏋️ Практика модуля»**: 2–3 лабы на 20–40 минут с решениями под спойлером.
 
 ## 📚 Оглавление
 
@@ -30,7 +32,7 @@
 - [13. System Design для DevOps](#m13)
 - [14. Практика: troubleshooting-кейсы и live-coding](#m14)
 - [15. Soft skills, HR и переговоры](#m15)
-- [🏋️ Практикум: 40 задач с решениями](#practice)
+- [🏋️ Практикум: 55 задач с решениями](#practice)
 - [⚡ DevOps-шпаргалка на одной странице](#cheatsheet)
 - [❓ 150 вопросов с собеседований DevOps 2026](#questions)
 - [🗺️ Дорожная карта DevOps 2026](#roadmap)
@@ -259,6 +261,66 @@ grep -rl old . | xargs sed -i 's/old/new/g'
 10. **Что такое `ulimit` / «Too many open files»?** — Лимит дескрипторов; поднять `LimitNOFILE` в юните или `/etc/security/limits.conf`.
 
 
+## 🏋️ Практика модуля
+
+> ⏱ ~30 минут. Нужна любая Linux-машина, WSL2 или `docker run -it --rm --privileged ubuntu:24.04`.
+
+**1.1. Создай зомби и избавься от него**
+
+```bash
+# Родитель (exec sleep 300) не вызывает wait() для дочернего sleep 1
+bash -c 'sleep 1 & exec sleep 300' &
+sleep 2
+```
+
+<details><summary>▶️ Решение</summary>
+
+```bash
+ps -eo pid,ppid,stat,cmd | awk '$3 ~ /Z/'   # видим <defunct> и его PPID
+kill -9 <ZOMBIE_PID>                       # не поможет — он уже мёртв
+kill <PPID>                                # убиваем родителя → зомби подхватит init и пожнёт
+```
+**Для интервью:** зомби не тратит CPU/RAM, но занимает PID. Тысячи зомби = исчерпание `pid_max`. В контейнере — запускай с `--init` (tini).
+</details>
+
+**1.2. Поймай «Too many open files»**
+
+```bash
+ulimit -n 64
+python3 -c "fs=[open('/dev/null') for _ in range(100)]"
+```
+
+<details><summary>▶️ Решение</summary>
+
+```bash
+# OSError: [Errno 24] Too many open files
+cat /proc/<PID>/limits | grep 'open files'   # лимит конкретного процесса
+ls /proc/<PID>/fd | wc -l                    # сколько открыто сейчас
+# Постоянно: LimitNOFILE=65536 в [Service] юнита → systemctl daemon-reload && restart
+```
+**Ловушка:** правка `/etc/security/limits.conf` не действует на systemd-сервисы — только `LimitNOFILE` в юните.
+</details>
+
+**1.3. Высокий Load Average при простаивающем CPU**
+
+```bash
+# Терминал 1: генерируем I/O мимо page cache
+for i in 1 2 3 4; do dd if=/dev/zero of=/tmp/io$i bs=1M count=2000 oflag=direct & done
+# Терминал 2: наблюдаем
+vmstat 1     # смотри колонки r, b, wa
+uptime
+```
+
+<details><summary>▶️ Что должен увидеть и объяснить</summary>
+
+- `b` (процессы в D-состоянии) > 0, `wa` (iowait) высокий, `us`/`sy` низкие.
+- LA растёт, потому что в Linux он считает и R, и **D**-процессы.
+- Дальше: `iostat -xz 1` (`%util`, `await`) и `pidstat -d 1` — кто пишет.
+- Уборка: `rm -f /tmp/io*`.
+</details>
+
+🔗 Больше задач: [Практикум №1–7](#p-linux) — диск, inode, systemd, strace, SUID, logrotate, cron.
+
 ---
 
 <a id="m02"></a>
@@ -384,6 +446,67 @@ iptables -L -n -v ; nft list ruleset
 8. **Как проверить, открыт ли порт?** — `nc -zv`, `ss`, `telnet`, `curl`.
 
 
+## 🏋️ Практика модуля
+
+> ⏱ ~30 минут. Нужны `dig`, `curl`, `tcpdump`, `nft` (пакеты `dnsutils`, `tcpdump`, `nftables`).
+
+**2.1. Пройди DNS-резолв вручную**
+
+Найди авторитетные NS для `github.com`, спроси их напрямую и сравни TTL с ответом публичного резолвера.
+
+<details><summary>▶️ Решение</summary>
+
+```bash
+dig +trace github.com                  # root → .com → авторитетные NS
+dig +short NS github.com
+dig @<один_из_NS> github.com A         # ответ с флагом aa (authoritative)
+dig @1.1.1.1 github.com A              # TTL меньше — запись из кэша, «тикает» вниз
+dig +short SOA github.com              # последнее поле — TTL негативного кэша (NXDOMAIN)
+```
+**Для интервью:** «Поменяли A-запись, а у части клиентов старый IP» → кэши до истечения TTL. Перед миграцией заранее снижай TTL до 60 с.
+</details>
+
+**2.2. Увидь TCP handshake и закрытие своими глазами**
+
+```bash
+sudo tcpdump -i any -nn 'tcp port 80 and tcp[tcpflags] & (tcp-syn|tcp-fin|tcp-rst) != 0' &
+curl -s -o /dev/null http://example.com
+```
+
+<details><summary>▶️ Что должен увидеть</summary>
+
+```
+Flags [S]    клиент → сервер   SYN
+Flags [S.]   сервер → клиент   SYN-ACK
+Flags [F.]   ...               FIN (закрытие, 4 сегмента: FIN/ACK/FIN/ACK)
+```
+Если вместо `[S.]` приходит `[R.]` — порт закрыт (RST). Если ответа нет вообще — пакет режет файрвол (DROP) → клиент получит таймаут, а не «connection refused».
+</details>
+
+**2.3. Файрвол на nftables: разрешить только SSH и HTTPS**
+
+<details><summary>▶️ Решение</summary>
+
+```bash
+cat > /etc/nftables.conf <<'EOF'
+table inet filter {
+  chain input {
+    type filter hook input priority 0; policy drop;
+    ct state established,related accept   # без этого сломаются ответы на исходящие
+    iif lo accept
+    ip protocol icmp accept
+    tcp dport { 22, 443 } accept
+  }
+}
+EOF
+nft -c -f /etc/nftables.conf && nft -f /etc/nftables.conf   # -c = проверка синтаксиса
+nft list ruleset
+```
+**Ловушка:** применять `policy drop` по SSH без правила для 22 — потеряешь доступ. Страховка: `at now + 5 min <<< 'nft flush ruleset'`.
+</details>
+
+🔗 Больше задач: [Практикум №8–11](#p-net) — тайминги curl, диагностика порта, подсети, TLS.
+
 ---
 
 <a id="m03"></a>
@@ -451,6 +574,50 @@ git blame -L 10,20 file
 7. Как разрешаешь конфликты?
 8. Что такое git hooks? — pre-commit, commit-msg, pre-push; серверные pre-receive.
 
+
+## 🏋️ Практика модуля
+
+> ⏱ ~20 минут. Создай песочницу: `mkdir g && cd g && git init -b main`.
+
+**3.1. Разреши конфликт слияния**
+
+```bash
+echo "port: 80" > app.yaml && git add . && git commit -m init
+git switch -c feature && echo "port: 8080" > app.yaml && git commit -am "port 8080"
+git switch main && echo "port: 443" > app.yaml && git commit -am "port 443"
+git merge feature
+```
+
+<details><summary>▶️ Решение</summary>
+
+```bash
+git status                      # both modified: app.yaml
+git diff                        # маркеры <<<<<<< ======= >>>>>>>
+# Вариант 1: правим руками и коммитим
+vim app.yaml && git add app.yaml && git commit
+# Вариант 2: взять одну сторону целиком
+git checkout --theirs app.yaml  # или --ours
+# Передумал — отменить слияние
+git merge --abort
+```
+</details>
+
+**3.2. Причеши историю перед MR**
+
+Сделай 4 коммита `wip 1..4` и преврати их в один осмысленный.
+
+<details><summary>▶️ Решение</summary>
+
+```bash
+for i in 1 2 3 4; do echo $i >> f; git add f; git commit -m "wip $i"; done
+git rebase -i HEAD~4    # первый — pick, остальные — squash (s) или fixup (f)
+# Альтернатива без редактора:
+git reset --soft HEAD~4 && git commit -m "feat: add f"
+git push --force-with-lease   # если ветка уже была запушена (только своя ветка!)
+```
+</details>
+
+🔗 Больше задач: [Практикум №41–43](#p-git) — reflog, `git bisect run`, удаление секрета из истории.
 
 ---
 
@@ -548,6 +715,73 @@ docker buildx build --platform linux/amd64,linux/arm64 -t repo/app:1.0 --push .
 8. Что будет с данными при удалении контейнера? — Пропадут, если не в volume.
 9. Почему контейнер с exit code 137? — SIGKILL, чаще всего **OOMKilled**.
 
+
+## 🏋️ Практика модуля
+
+> ⏱ ~30 минут. Нужны Linux с root и Docker.
+
+**4.1. Собери «контейнер» без Docker**
+
+Запусти shell в отдельных PID/UTS/mount/net namespaces и убедись, что он изолирован.
+
+<details><summary>▶️ Решение</summary>
+
+```bash
+sudo unshare --pid --fork --mount-proc --uts --net bash
+hostname container-1 && hostname   # хост не изменился
+ps aux                              # bash — это PID 1, процессов хоста не видно
+ip a                                # только lo, и тот DOWN
+exit
+# Посмотреть namespaces реального контейнера:
+docker run -d --name ns nginx && sudo lsns -p $(docker inspect -f '{{.State.Pid}}' ns)
+```
+**Для интервью:** «Контейнер — это обычный процесс с namespaces + cgroups + урезанными capabilities и своей корневой ФС».
+</details>
+
+**4.2. Найди лимиты cgroup изнутри контейнера**
+
+```bash
+docker run --rm --memory 256m --cpus 0.5 alpine sh -c 'cat /sys/fs/cgroup/memory.max /sys/fs/cgroup/cpu.max'
+```
+
+<details><summary>▶️ Что должен увидеть</summary>
+
+```
+268435456          # 256 MiB
+50000 100000       # 50 мс CPU на каждые 100 мс периода = 0.5 ядра
+```
+**Ловушка:** `free` и `nproc` внутри контейнера показывают ресурсы **хоста**. Старые JVM/Node видели всю память хоста и падали по OOM — нужны cgroup-aware рантаймы (`-XX:MaxRAMPercentage`).
+</details>
+
+**4.3. Сократи образ в 10 раз**
+
+Собери Python-приложение на `python:3.12`, затем на `python:3.12-slim` и через multi-stage; сравни размеры.
+
+<details><summary>▶️ Решение</summary>
+
+```dockerfile
+FROM python:3.12-slim AS build
+WORKDIR /app
+COPY requirements.txt .
+RUN pip wheel --no-cache-dir -w /wheels -r requirements.txt
+
+FROM python:3.12-slim
+RUN useradd -r app
+WORKDIR /app
+COPY --from=build /wheels /wheels
+RUN pip install --no-cache-dir /wheels/* && rm -rf /wheels
+COPY . .
+USER app
+CMD ["python", "main.py"]
+```
+```bash
+docker image ls | grep myapp       # ~1 ГБ → ~150 МБ
+docker history myapp:slim          # какой слой сколько весит
+dive myapp:slim                    # интерактивный анализ слоёв
+```
+</details>
+
+🔗 Больше задач: [Практикум №12–16](#p-docker) — плохой Dockerfile, SIGTERM, OOM, compose, Trivy + cosign.
 
 ---
 
@@ -708,6 +942,77 @@ CRD расширяет API, оператор — контроллер, авто�
 13. Как бэкапить кластер? — etcd snapshot + Velero для ресурсов и PV.
 
 
+## 🏋️ Практика модуля
+
+> ⏱ ~40 минут. Нужен `kind`: `kind create cluster --name interview`.
+
+**5.1. Спидран: почини три сломанных пода за 10 минут**
+
+```bash
+kubectl run p1 --image=nginx:1.999                                     # 1
+kubectl run p2 --image=nginx --overrides='{"spec":{"containers":[{"name":"p2","image":"nginx","envFrom":[{"configMapRef":{"name":"nope"}}]}]}}'  # 2
+kubectl run p3 --image=polinux/stress --overrides='{"spec":{"containers":[{"name":"p3","image":"polinux/stress","command":["stress","--vm","1","--vm-bytes","200M"],"resources":{"limits":{"memory":"64Mi"}}}]}}'  # 3
+kubectl get pods -w
+```
+
+<details><summary>▶️ Решение</summary>
+
+| Под | Статус | Диагноз | Починка |
+|-----|--------|---------|---------|
+| p1 | `ImagePullBackOff` | `describe` → `manifest unknown` | правильный тег |
+| p2 | `CreateContainerConfigError` | `describe` → `configmap "nope" not found` | `kubectl create cm nope` |
+| p3 | `OOMKilled` → `CrashLoopBackOff` | `describe` → Last State: OOMKilled, exit 137 | поднять limit или чинить потребление |
+
+```bash
+kubectl describe pod p1 | tail -20
+kubectl set image pod/p1 p1=nginx:1.27
+```
+Цель — за 2–3 минуты на под проговаривать вслух: статус → `describe`/Events → `logs --previous` → гипотеза → фикс.
+</details>
+
+**5.2. Drain ноды упирается в PDB**
+
+```bash
+kind create cluster --name pdb --config - <<'EOF'
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes: [{role: control-plane}, {role: worker}, {role: worker}]
+EOF
+kubectl create deploy web --image=nginx --replicas=2
+kubectl create pdb web --selector=app=web --min-available=2
+kubectl drain pdb-worker --ignore-daemonsets
+```
+
+<details><summary>▶️ Решение</summary>
+
+Drain зависает: `Cannot evict pod as it would violate the pod's disruption budget`. При `minAvailable` = числу реплик выселить нельзя ни один под.
+
+```bash
+kubectl scale deploy web --replicas=3        # появляется запас
+# или правильный PDB:
+kubectl delete pdb web && kubectl create pdb web --selector=app=web --max-unavailable=1
+kubectl uncordon pdb-worker
+```
+**Для интервью:** именно так ломаются автоматические апгрейды нод в EKS/GKE.
+</details>
+
+**5.3. YAML без ручного набора (трюк с CKA)**
+
+<details><summary>▶️ Решение</summary>
+
+```bash
+export do="--dry-run=client -o yaml"
+kubectl create deploy api --image=nginx --replicas=3 --port=80 $do > deploy.yaml
+kubectl expose deploy api --port=80 --target-port=80 $do > svc.yaml   # нужен существующий deploy, иначе пиши руками
+kubectl create cm api --from-literal=LOG_LEVEL=info $do > cm.yaml
+kubectl create job once --image=busybox $do -- echo hi > job.yaml
+kubectl create cronjob nightly --image=busybox --schedule="0 3 * * *" $do -- date > cj.yaml
+kubectl explain deploy.spec.strategy.rollingUpdate      # документация полей без браузера
+```
+</details>
+
+🔗 Больше задач: [Практикум №17–25](#p-k8s) — 10 ошибок в манифесте, Pending, Service, rollout, HPA, NetworkPolicy, RBAC.
+
 ---
 
 <a id="m06"></a>
@@ -844,6 +1149,89 @@ jobs:
 9. Что такое DORA-метрики?
 
 
+## 🏋️ Практика модуля
+
+> ⏱ ~30 минут. Нужен аккаунт GitHub или GitLab.
+
+**6.1. Ускорь медленную джобу**
+
+```yaml
+test:
+  image: node:22
+  script:
+    - npm install
+    - npm run lint
+    - npm test
+    - npm run build
+```
+
+<details><summary>▶️ Решение</summary>
+
+```yaml
+.node:
+  image: node:22-alpine
+  cache:
+    key: { files: [package-lock.json] }      # кэш инвалидируется только при смене lock-файла
+    paths: [.npm/]
+  before_script: [npm ci --cache .npm --prefer-offline]
+
+lint:  { extends: .node, stage: test,  script: [npm run lint] }
+test:  { extends: .node, stage: test,  script: [npm test -- --shard=$CI_NODE_INDEX/$CI_NODE_TOTAL], parallel: 4 }
+build: { extends: .node, stage: build, script: [npm run build], needs: [lint, test] }
+```
+Что изменилось: `npm ci` вместо `install`, кэш по lock-файлу, lint и тесты параллельно, шардирование тестов, лёгкий образ, `needs` (DAG) вместо ожидания всей стадии.
+</details>
+
+**6.2. Build once, deploy many: продвинь образ по digest**
+
+<details><summary>▶️ Решение</summary>
+
+```bash
+# CI собирает один раз и запоминает digest
+docker buildx build -t registry/app:$SHA --push . \
+  --metadata-file meta.json
+DIGEST=$(jq -r '."containerimage.digest"' meta.json)
+
+# Промоушен в stage/prod — без пересборки, просто новый тег на тот же digest
+crane tag registry/app@$DIGEST prod-$SHA
+# В манифесте/values деплоим по digest, а не по тегу
+helm upgrade app ./chart --set image.digest=$DIGEST
+```
+**Почему:** пересборка для прода = другой артефакт (другие версии пакетов в `apt`), и тесты на stage ничего не гарантируют.
+</details>
+
+**6.3. Canary с Argo Rollouts**
+
+<details><summary>▶️ Решение</summary>
+
+```yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata: { name: api }
+spec:
+  replicas: 10
+  selector: { matchLabels: { app: api } }
+  template:          # такой же, как в Deployment
+    metadata: { labels: { app: api } }
+    spec: { containers: [{ name: api, image: registry/api:2.0 }] }
+  strategy:
+    canary:
+      steps:
+        - setWeight: 10
+        - pause: { duration: 5m }
+        - analysis: { templates: [{ templateName: error-rate }] }   # PromQL: 5xx < 1%
+        - setWeight: 50
+        - pause: { duration: 10m }
+```
+```bash
+kubectl argo rollouts get rollout api --watch
+kubectl argo rollouts abort api      # ручной откат
+```
+Если анализ провален — Rollout откатывается сам.
+</details>
+
+🔗 Больше задач: [Практикум №26–28](#p-ci) — GitHub Actions, GitLab CI с окружениями, Argo CD.
+
 ---
 
 <a id="m07"></a>
@@ -955,6 +1343,83 @@ Pulumi (IaC на TS/Python/Go), Crossplane (IaC через K8s CRD), CloudFormat
 10. Как хранить секреты в Terraform? — не в коде; Vault provider, SM, `sensitive = true`, шифрование state.
 
 
+## 🏋️ Практика модуля
+
+> ⏱ ~30 минут. Облако не нужно: используй провайдеры `local`/`random`/`null` или `kreuzwerker/docker`.
+
+**7.1. Переведи `count` на `for_each` без пересоздания**
+
+```hcl
+variable "users" { default = ["alice", "bob", "carol"] }
+resource "local_file" "u" {
+  count    = length(var.users)
+  filename = "${path.module}/out/${var.users[count.index]}.txt"
+  content  = var.users[count.index]
+}
+```
+Удали `bob` из списка и посмотри `plan` — почему пересоздаётся `carol`?
+
+<details><summary>▶️ Решение</summary>
+
+Индексы сдвинулись: `u[2]` (carol) → `u[1]`. Переходим на ключи:
+
+```hcl
+resource "local_file" "u" {
+  for_each = toset(var.users)
+  filename = "${path.module}/out/${each.key}.txt"
+  content  = each.key
+}
+moved { from = local_file.u[0] to = local_file.u["alice"] }
+moved { from = local_file.u[1] to = local_file.u["bob"] }
+moved { from = local_file.u[2] to = local_file.u["carol"] }
+```
+`terraform plan` → `0 to add, 0 to destroy`. Теперь удаление `bob` трогает только `bob`.
+</details>
+
+**7.2. Сделай Ansible-задачу идемпотентной**
+
+```yaml
+- name: Download and install tool
+  ansible.builtin.shell: curl -sL https://example.com/tool.tgz | tar xz -C /usr/local/bin
+- name: Add line
+  ansible.builtin.shell: echo "vm.swappiness=10" >> /etc/sysctl.conf
+```
+
+<details><summary>▶️ Решение</summary>
+
+```yaml
+- name: Download and install tool
+  ansible.builtin.unarchive:
+    src: https://example.com/tool.tgz
+    dest: /usr/local/bin
+    remote_src: true
+    creates: /usr/local/bin/tool      # не скачивать повторно
+- name: Set swappiness
+  ansible.posix.sysctl:
+    name: vm.swappiness
+    value: "10"
+    state: present                    # не дописывает строку при каждом запуске
+```
+Проверка: второй прогон `ansible-playbook site.yml` → `changed=0`.
+</details>
+
+**7.3. Drift detection в CI**
+
+<details><summary>▶️ Решение</summary>
+
+```bash
+terraform plan -detailed-exitcode -lock=false -input=false
+case $? in
+  0) echo "Нет изменений" ;;
+  1) echo "Ошибка plan"; exit 1 ;;
+  2) echo "DRIFT обнаружен"; ./notify-slack.sh; exit 2 ;;
+esac
+```
+Запускать по расписанию (nightly) для каждого стейта. Только чтение облака — отдельная роль с read-only правами.
+</details>
+
+🔗 Больше задач: [Практикум №29–32](#p-iac) — модуль VPC, `moved`/`import`, remote state, Ansible-роль.
+
 ---
 
 <a id="m08"></a>
@@ -1030,6 +1495,72 @@ Operational Excellence, Security, Reliability, Performance Efficiency, Cost Opti
 7. Что такое shared responsibility?
 8. Что делать, если ключ доступа утёк на GitHub? — немедленно деактивировать, ротировать, проверить CloudTrail, найти созданные ресурсы.
 
+
+## 🏋️ Практика модуля
+
+> ⏱ ~30 минут. Можно на бумаге; для проверки — AWS Free Tier / Yandex Cloud trial или LocalStack.
+
+**8.1. IAM-политика по принципу least privilege**
+
+Сервису нужно читать и писать объекты только в префикс `uploads/` бакета `acme-media`, удалять нельзя.
+
+<details><summary>▶️ Решение</summary>
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["s3:GetObject", "s3:PutObject"],
+      "Resource": "arn:aws:s3:::acme-media/uploads/*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::acme-media",
+      "Condition": { "StringLike": { "s3:prefix": ["uploads/*"] } }
+    }
+  ]
+}
+```
+**Ловушка:** `ListBucket` применяется к **бакету**, а `Get/PutObject` — к **объектам** (`/*`). Перепутать ARN — частая ошибка. Проверка: IAM Policy Simulator или `aws iam simulate-principal-policy`.
+</details>
+
+**8.2. Спроектируй VPC на 3 зоны**
+
+Дан `10.0.0.0/16`. Нужны публичные подсети (только LB и NAT), приватные для приложений/K8s (много IP) и изолированные для БД, в каждой из 3 AZ.
+
+<details><summary>▶️ Решение</summary>
+
+| Слой | AZ-a | AZ-b | AZ-c | Маршрут |
+|------|------|------|------|---------|
+| public /24 | 10.0.0.0/24 | 10.0.1.0/24 | 10.0.2.0/24 | 0.0.0.0/0 → IGW |
+| private /19 | 10.0.32.0/19 | 10.0.64.0/19 | 10.0.96.0/19 | 0.0.0.0/0 → NAT в своей AZ |
+| db /24 | 10.0.10.0/24 | 10.0.11.0/24 | 10.0.12.0/24 | без выхода в интернет |
+
+Почему так: поды в EKS (VPC CNI) получают IP из VPC → приватным подсетям нужен большой запас (/19 = 8190 адресов). NAT в каждой AZ — чтобы падение одной зоны не отрезало остальные (и нет межзонового трафика). Оставлен резерв 10.0.128.0/17 под рост.
+</details>
+
+**8.3. Найди «мусор», за который платишь**
+
+<details><summary>▶️ Решение</summary>
+
+```bash
+# Неподключённые диски
+aws ec2 describe-volumes --filters Name=status,Values=available \
+  --query 'Volumes[].[VolumeId,Size,CreateTime]' --output table
+# Неиспользуемые Elastic IP (платные, если не привязаны)
+aws ec2 describe-addresses --query 'Addresses[?AssociationId==null].PublicIp'
+# Снапшоты старше 90 дней
+aws ec2 describe-snapshots --owner-ids self \
+  --query "Snapshots[?StartTime<='$(date -d '-90 days' +%F)'].[SnapshotId,VolumeSize]"
+# Балансировщики без таргетов — через describe-target-health по каждой target group
+```
+Yandex Cloud: `yc compute disk list`, `yc vpc address list` — ищем записи без `instance_id`/`used: false`.
+</details>
+
+🔗 Больше задач: [Практикум №44–46](#p-cloud) — безопасный S3 на Terraform, OIDC для CI, FinOps-кейс.
 
 ---
 
@@ -1139,6 +1670,81 @@ groups:
 9. Что такое OpenTelemetry и Collector?
 10. RED vs USE?
 
+
+## 🏋️ Практика модуля
+
+> ⏱ ~40 минут. Удобно делать поверх стенда из [задачи 33](#p-mon).
+
+**9.1. Инструментируй своё приложение**
+
+Добавь в Python-сервис метрики RED: счётчик запросов и гистограмму длительности.
+
+<details><summary>▶️ Решение</summary>
+
+```python
+# pip install prometheus-client flask
+import random, time
+from flask import Flask
+from prometheus_client import Counter, Histogram, make_wsgi_app
+from werkzeug.middleware.dispatcher import DispatcherMiddleware
+
+app = Flask(__name__)
+REQS = Counter("http_requests_total", "Requests", ["method", "route", "status"])
+LAT = Histogram("http_request_duration_seconds", "Latency", ["route"],
+                buckets=[.01, .05, .1, .25, .5, 1, 2.5])
+
+@app.route("/api")
+def api():
+    with LAT.labels("/api").time():
+        time.sleep(random.random() / 5)
+        status = 500 if random.random() < 0.05 else 200
+    REQS.labels("GET", "/api", str(status)).inc()
+    return "ok", status
+
+app.wsgi_app = DispatcherMiddleware(app.wsgi_app, {"/metrics": make_wsgi_app()})
+app.run(host="0.0.0.0", port=8000)
+```
+Лейбл `route` — шаблон пути (`/users/{id}`), а **не** реальный URL — иначе взрыв кардинальности.
+</details>
+
+**9.2. Найди, кто раздул Prometheus**
+
+<details><summary>▶️ Решение</summary>
+
+```promql
+# Топ-10 метрик по числу серий
+topk(10, count by (__name__) ({__name__=~".+"}))
+# Какой лейбл виноват
+count(count by (path) (http_requests_total))
+# Какой таргет приносит больше всего серий
+topk(5, scrape_series_added)
+```
+```bash
+curl -s localhost:9090/api/v1/status/tsdb | jq '.data.seriesCountByMetricName[:10]'
+```
+Лечение: убрать лейбл в коде или `metric_relabel_configs` с `action: labeldrop`, лимиты `sample_limit` на таргет.
+</details>
+
+**9.3. Recording rule для тяжёлого запроса**
+
+<details><summary>▶️ Решение</summary>
+
+```yaml
+groups:
+  - name: api-recording
+    interval: 30s
+    rules:
+      - record: job:http_requests:rate5m
+        expr: sum by (job) (rate(http_requests_total[5m]))
+      - record: job:http_errors:ratio_rate5m
+        expr: |
+          sum by (job) (rate(http_requests_total{status=~"5.."}[5m]))
+          / sum by (job) (rate(http_requests_total[5m]))
+```
+Дашборды и алерты используют `job:http_errors:ratio_rate5m` — быстро и дёшево. Конвенция имени: `level:metric:operations`.
+</details>
+
+🔗 Больше задач: [Практикум №33–35](#p-mon) — стенд Prometheus + Grafana, 8 запросов PromQL, burn rate.
 
 ---
 
@@ -1284,6 +1890,100 @@ def check(url, retries=3, backoff=2):
 5. Когда Bash, а когда Python/Go? — Bash для склейки команд до ~100 строк; дальше — Python/Go (структуры данных, тесты, ошибки).
 
 
+## 🏋️ Практика модуля
+
+> ⏱ ~30 минут. Проверяй Bash через `shellcheck script.sh`.
+
+**10.1. Найди 6 багов в скрипте**
+
+```bash
+#!/bin/bash
+DIR=$1
+for f in `ls $DIR/*.log`; do
+  if [ $(stat -c %s $f) -gt 1000000 ]; then
+    gzip $f
+  fi
+done
+cd /tmp/work
+rm -rf *
+echo "done"
+```
+
+<details><summary>▶️ Решение</summary>
+
+1. Нет `set -euo pipefail` — ошибки молча игнорируются.
+2. `$1` не проверяется — при пустом `DIR` пойдёт `/*.log`.
+3. `ls` в цикле ломается на пробелах в именах → `for f in "$DIR"/*.log`.
+4. Переменные без кавычек: `"$f"`, `"$DIR"`.
+5. **Опасно:** если `cd /tmp/work` упадёт, `rm -rf *` удалит текущий каталог → `cd /tmp/work || exit 1` или `rm -rf /tmp/work/*`.
+6. Обратные кавычки → `$(...)`; `[ ]` → `[[ ]]`.
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+DIR=${1:?usage: $0 <dir>}
+shopt -s nullglob
+for f in "$DIR"/*.log; do
+  if [[ $(stat -c %s "$f") -gt 1000000 ]]; then gzip -- "$f"; fi
+done
+rm -rf -- /tmp/work/*
+echo "done"
+```
+</details>
+
+**10.2. Функция retry с экспоненциальной задержкой**
+
+`retry 5 curl -fsS http://svc/health` — до 5 попыток, задержка 1, 2, 4, 8 с.
+
+<details><summary>▶️ Решение</summary>
+
+```bash
+retry() {
+  local max=$1; shift
+  local n=1 delay=1
+  until "$@"; do
+    (( n >= max )) && { echo "fail after $n attempts: $*" >&2; return 1; }
+    echo "attempt $n failed, retry in ${delay}s" >&2
+    sleep "$delay"
+    (( n++, delay *= 2 ))
+  done
+}
+```
+`"$@"` сохраняет аргументы с пробелами — главное, что проверяют в этой задаче.
+</details>
+
+**10.3. Параллельная проверка 200 URL на Python**
+
+<details><summary>▶️ Решение</summary>
+
+```python
+#!/usr/bin/env python3
+import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import requests
+
+def check(url: str) -> tuple[str, str]:
+    try:
+        r = requests.get(url, timeout=5)
+        return url, str(r.status_code)
+    except requests.RequestException as e:
+        return url, type(e).__name__
+
+urls = [u.strip() for u in open(sys.argv[1]) if u.strip()]
+bad = 0
+with ThreadPoolExecutor(max_workers=20) as pool:
+    for fut in as_completed(pool.submit(check, u) for u in urls):
+        url, res = fut.result()
+        if not res.startswith(("2", "3")):
+            bad += 1
+            print(f"{url} -> {res}")
+sys.exit(1 if bad else 0)        # ненулевой код — удобно для CI и cron
+```
+Потоки подходят, потому что задача I/O-bound (GIL отпускается на сетевых вызовах). Альтернатива — `asyncio` + `httpx`.
+</details>
+
+🔗 Больше задач: [Практикум №36–38](#p-code) — анализ лога nginx, бэкап PostgreSQL, отчёт о подах.
+
 ---
 
 <a id="m11"></a>
@@ -1343,6 +2043,93 @@ Broken Access Control, Security Misconfiguration, Software Supply Chain Failures
 6. Что такое zero trust?
 7. Как защитить CI/CD от компрометации?
 
+
+## 🏋️ Практика модуля
+
+> ⏱ ~30 минут. Нужны Docker, `kind`, `trivy`, `pre-commit`.
+
+**11.1. Не дай секрету попасть в репозиторий**
+
+<details><summary>▶️ Решение</summary>
+
+```yaml
+# .pre-commit-config.yaml
+repos:
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.21.2            # пинить версию
+    hooks: [{ id: gitleaks }]
+```
+```bash
+pre-commit install
+echo 'aws_secret_access_key = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"' > leak.txt
+git add leak.txt && git commit -m test      # коммит заблокирован
+gitleaks detect --source . --log-opts="--all"   # скан всей истории
+```
+Локальный хук можно обойти (`--no-verify`), поэтому дублируй проверку в CI и включи push protection на стороне Git-сервера.
+</details>
+
+**11.2. Доведи под до Pod Security Standard `restricted`**
+
+```bash
+kubectl create ns secure
+kubectl label ns secure pod-security.kubernetes.io/enforce=restricted
+kubectl -n secure run web --image=nginx      # отклонено — почему?
+```
+
+<details><summary>▶️ Решение</summary>
+
+Обычный nginx работает от root и пишет в `/var/cache/nginx`. Используем unprivileged-образ и `securityContext`:
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata: { name: web, namespace: secure }
+spec:
+  automountServiceAccountToken: false
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 101
+    seccompProfile: { type: RuntimeDefault }
+  containers:
+    - name: web
+      image: nginxinc/nginx-unprivileged:1.27
+      ports: [{ containerPort: 8080 }]
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities: { drop: [ALL] }
+      volumeMounts:
+        - { name: tmp, mountPath: /tmp }
+  volumes:
+    - { name: tmp, emptyDir: {} }
+```
+Проверка всего кластера: `kubescape scan framework nsa` или `trivy k8s --report summary`.
+</details>
+
+**11.3. Запрети `:latest` политикой Kyverno**
+
+<details><summary>▶️ Решение</summary>
+
+```yaml
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata: { name: disallow-latest-tag }
+spec:
+  validationFailureAction: Enforce
+  rules:
+    - name: require-pinned-image
+      match: { any: [{ resources: { kinds: [Pod] } }] }
+      validate:
+        message: "Используй фиксированный тег или digest, не :latest"
+        pattern:
+          spec:
+            containers:
+              - image: "!*:latest & *:*"   # тег обязателен и не latest
+```
+Правило на `Pod` Kyverno автоматически распространяет на Deployment/StatefulSet/Job (autogen).
+</details>
+
+🔗 Больше задач: [Практикум №47–49](#p-sec) — Trivy-гейт в CI, External Secrets + Vault, подпись и проверка образов.
 
 ---
 
@@ -1421,6 +2208,85 @@ Broken Access Control, Security Misconfiguration, Software Supply Chain Failures
 8. DevOps vs SRE?
 
 
+## 🏋️ Практика модуля
+
+> ⏱ ~30 минут. Калькулятор и текстовый редактор.
+
+**12.1. Посчитай error budget**
+
+SLO доступности — 99.9% за 28 дней. Сервис обрабатывает 10 млн запросов в сутки. Был инцидент: 40 минут 30% запросов возвращали 5xx. Сколько бюджета сожжено и можно ли релизить?
+
+<details><summary>▶️ Решение</summary>
+
+```
+Запросов за 28 дней:  10 000 000 × 28            = 280 000 000
+Бюджет ошибок:        280 000 000 × 0.001        = 280 000
+Запросов за 40 минут: 10 000 000 / 1440 × 40     ≈ 277 800
+Ошибок в инциденте:   277 800 × 0.3              ≈ 83 300
+Сожжено:              83 300 / 280 000           ≈ 30% бюджета
+Burn rate инцидента:  0.30 / 0.001               = 300 (бюджет кончился бы за ~2.2 ч)
+```
+Бюджета осталось ~70% → релизы можно продолжать, но с action items из постмортема. Если бы осталось < 0 — по error budget policy фриз фич до восстановления.
+</details>
+
+**12.2. Напиши постмортем за 20 минут**
+
+Возьми задачу [39](#p-inc) или свой реальный инцидент и заполни шаблон.
+
+<details><summary>▶️ Пример заполнения</summary>
+
+```markdown
+# Postmortem: 5xx на checkout-api, 2026-03-13
+**Статус:** закрыт · **Severity:** SEV2 · **IC:** @ivan · **Длительность:** 18:02–18:41 (39 мин)
+
+## Влияние
+30% запросов к оформлению заказа завершались ошибкой; ~4 100 неуспешных заказов.
+
+## Таймлайн (MSK)
+- 17:55 деплой checkout-api v2.14 (rolling, 100% сразу)
+- 18:02 алерт ErrorBudgetBurn (burn rate 14.4)
+- 18:09 IC объявил инцидент, канал #inc-0313
+- 18:21 корреляция с релизом, решение откатить
+- 18:27 `argocd app rollback checkout-api`
+- 18:41 5xx на базовом уровне, инцидент закрыт
+
+## Root cause
+В v2.14 изменился таймаут пула соединений к БД (30s → 3s) через новый дефолт библиотеки; под нагрузкой пул исчерпывался.
+
+## Что помогло / помешало / повезло
++ алерт по burn rate сработал через 7 минут
+− 19 минут на поиск связи с релизом: в дашборде нет аннотаций деплоев
+~ релиз был в начале пикового часа, а не в его середине
+
+## Action items
+| Действие | Владелец | Срок |
+|---|---|---|
+| Canary 10% с автоанализом (Argo Rollouts) | @olga | 2026-03-27 |
+| Аннотации деплоев в Grafana | @ivan | 2026-03-20 |
+| Нагрузочный тест в CI для checkout | @petr | 2026-04-10 |
+```
+Без имён виноватых — «деплой выкатили», а не «Петя выкатил».
+</details>
+
+**12.3. Мини-chaos: проверь, что сервис переживает потерю пода**
+
+<details><summary>▶️ Решение</summary>
+
+```bash
+kubectl create deploy web --image=nginx --replicas=3
+kubectl expose deploy web --port=80
+kubectl run load --image=williamyeh/hey --restart=Never -- -z 60s -c 20 http://web
+# Параллельно убиваем по поду каждые 10 секунд
+for i in 1 2 3 4 5; do
+  kubectl delete $(kubectl get pod -l app=web -o name | shuf -n1) --wait=false; sleep 10
+done
+kubectl logs load | grep -A5 'Status code distribution'
+```
+Если видишь ошибки — добавь readinessProbe, `preStop: sleep 5`, PDB и graceful shutdown, повтори и сравни.
+</details>
+
+🔗 Больше задач: [Практикум №50–52](#p-sre) — SLO и error budget policy, runbook, game day.
+
 ---
 
 <a id="m13"></a>
@@ -1484,6 +2350,50 @@ Global LB / GeoDNS / anycast, данные: выбрать между конси
 - **PACELC**: и без разделения — компромисс latency vs consistency.
 
 
+## 🏋️ Практика модуля
+
+> ⏱ 45 минут на задачу, засекай время. Рисуй в Excalidraw / draw.io или прямо в Mermaid.
+
+**13.1. Оценка «на салфетке»: логирование**
+
+500 нод, 2 ТБ логов в сутки, хранение: 7 дней «горячих» с поиском, 90 дней «холодных». Посчитай поток, объём и порядок стоимости.
+
+<details><summary>▶️ Решение</summary>
+
+```
+Поток:        2 ТБ / 86 400 с ≈ 23 МБ/с в среднем, пик ×3 ≈ 70 МБ/с
+На ноду:      2 ТБ / 500 ≈ 4 ГБ/сутки ≈ 46 КБ/с — агенту (Fluent Bit/Vector) хватит
+Горячее:      2 ТБ × 7 = 14 ТБ сырых; Loki/ClickHouse сжимают ×5–10 → 1.5–3 ТБ (+реплика ×2)
+Холодное:     2 ТБ × 90 = 180 ТБ сырых → ~20–35 ТБ в S3 после сжатия
+Буфер:        Kafka на 2–4 часа пика: 70 МБ/с × 4 ч ≈ 1 ТБ (×3 реплики)
+```
+Озвучивай допущения (коэффициент сжатия, пик) — интервьюер оценивает ход мысли, а не точные цифры.
+</details>
+
+**13.2. Нарисуй схему за 10 минут**
+
+Задача: «API + воркеры + PostgreSQL + Redis, 99.95%, один регион».
+
+<details><summary>▶️ Пример</summary>
+
+```mermaid
+flowchart LR
+  U[Пользователи] --> CDN[CDN / WAF]
+  CDN --> LB[L7 LB, 3 AZ]
+  LB --> API[API pods<br>HPA, 3 AZ]
+  API --> R[(Redis<br>replica + sentinel)]
+  API --> PG[(PostgreSQL<br>primary + sync standby<br>PgBouncer)]
+  API --> Q[[Очередь<br>Kafka/RabbitMQ]]
+  Q --> W[Workers<br>KEDA]
+  W --> PG
+  PG -.WAL + snapshots.-> S3[(S3: бэкапы<br>Object Lock)]
+  API -.OTel.-> OBS[Prometheus · Loki · Tempo]
+```
+Проговори: точки отказа и как каждая закрыта, как деплоим (GitOps + canary), RPO/RTO для БД, что первым упрётся при росте ×10.
+</details>
+
+🔗 Больше задач: [Практикум №53–55](#p-sd) — три полных mock-задачи с критериями оценки.
+
 ---
 
 <a id="m14"></a>
@@ -1546,7 +2456,7 @@ Mitigation: выпустить вручную, задеплоить. Root cause:
    - отсутствуют requests/limits;
    - secret в `env.value` открытым текстом.
 
-➡️ Готовые задания с решениями — в разделе [🏋️ Практикум: 40 задач](#practice).
+➡️ Готовые задания с решениями — в разделе [🏋️ Практикум: 55 задач](#practice).
 
 
 ---
@@ -1611,7 +2521,7 @@ CKA, CKAD, CKS (Kubernetes); AWS SAA / DevOps Pro; HashiCorp Terraform Associate
 
 <a id="practice"></a>
 
-# 🏋️ Практикум: 40 задач с решениями
+# 🏋️ Практикум: 55 задач с решениями
 
 > Делай руками, а не читай. Сначала попробуй решить сам, потом раскрой ▶️ решение.
 > Что нужно: Linux (или WSL2), Docker, `kind`/`minikube`, `kubectl`, `terraform`/`tofu`, `ansible`, Python 3.
@@ -1631,6 +2541,11 @@ CKA, CKAD, CKS (Kubernetes); AWS SAA / DevOps Pro; HashiCorp Terraform Associate
 | [📊 Мониторинг и PromQL](#p-mon) | 33–35 |
 | [🐍 Bash и Python](#p-code) | 36–38 |
 | [🚨 Разбор инцидентов](#p-inc) | 39–40 |
+| [🌿 Git](#p-git) | 41–43 |
+| [☁️ Облака и FinOps](#p-cloud) | 44–46 |
+| [🔐 DevSecOps](#p-sec) | 47–49 |
+| [🛡 SRE](#p-sre) | 50–52 |
+| [🧩 System Design (mock)](#p-sd) | 53–55 |
 
 ---
 
@@ -2811,14 +3726,436 @@ for r in sorted(rows, key=lambda r: -r[3]):
 
 ---
 
+<a id="p-git"></a>
+
+## 🌿 Git
+
+### Задача 41. Верни коммиты после `reset --hard`
+```bash
+git init -b main lab && cd lab
+for i in 1 2 3; do echo $i > f; git add f; git commit -qm "commit $i"; done
+git reset --hard HEAD~2      # «потеряли» два коммита
+git log --oneline            # остался только commit 1
+```
+
+<details><summary>▶️ Решение</summary>
+
+```bash
+git reflog                   # HEAD@{1}: commit: commit 3
+git reset --hard HEAD@{1}    # или git branch rescue <sha>
+git log --oneline            # все три на месте
+```
+**Для интервью:** reflog локален и хранится ~90 дней (`gc.reflogExpire`). Удалённую ветку восстанавливают так же: `git branch name <sha>`. Если коммит был только у коллеги и он сделал `push --force` — ищи в его reflog или в CI-кэше.
+</details>
+
+### Задача 42. Найди коммит, сломавший тест, автоматически
+```bash
+git init -b main bis && cd bis
+echo 'echo 4' > calc.sh && git add . && git commit -qm v0
+for i in $(seq 1 30); do echo "# $i" >> calc.sh; git commit -qam "c$i"; done
+sed -i 's/echo 4/echo 5/' calc.sh && git commit -qam "refactor"
+for i in $(seq 31 50); do echo "# $i" >> calc.sh; git commit -qam "c$i"; done
+# Тест: bash calc.sh должен печатать 4
+```
+
+<details><summary>▶️ Решение</summary>
+
+```bash
+git bisect start HEAD $(git rev-list --max-parents=0 HEAD)   # bad, good
+git bisect run sh -c '[ "$(bash calc.sh)" = 4 ]'              # exit 0 = good
+# ... <sha> is the first bad commit  →  refactor
+git bisect reset
+```
+52 коммита → ~6 шагов (log₂). Код возврата 125 в скрипте = «пропустить коммит» (не собирается).
+</details>
+
+### Задача 43. Удали секрет из истории
+В репозиторий три коммита назад попал файл `.env` с паролем БД, ветка уже запушена.
+
+<details><summary>▶️ Решение</summary>
+
+1. **Сначала ротировать секрет** — он уже скомпрометирован (форки, клоны, CI-кэши).
+2. Переписать историю:
+   ```bash
+   pip install git-filter-repo
+   git filter-repo --path .env --invert-paths      # или --replace-text secrets.txt
+   echo ".env" >> .gitignore && git commit -am "ignore .env"
+   git push --force --all && git push --force --tags
+   ```
+3. Попросить коллег переклонировать; на GitHub — обратиться в поддержку для очистки кэшированных view/PR.
+4. Профилактика: gitleaks в pre-commit и CI, push protection.
+
+**Ловушка:** ответ «удалю файл новым коммитом» — неверный, секрет остаётся в истории.
+</details>
+
+---
+
+<a id="p-cloud"></a>
+
+## ☁️ Облака и FinOps
+
+### Задача 44. Безопасный S3-бакет на Terraform
+Бакет для бэкапов: без публичного доступа, шифрование, версионирование, переход в холодный класс через 30 дней, удаление через 365.
+
+<details><summary>▶️ Решение</summary>
+
+```hcl
+resource "aws_s3_bucket" "backup" {
+  bucket = "acme-prod-backups"
+  lifecycle { prevent_destroy = true }
+}
+
+resource "aws_s3_bucket_public_access_block" "backup" {
+  bucket                  = aws_s3_bucket.backup.id
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+
+resource "aws_s3_bucket_versioning" "backup" {
+  bucket = aws_s3_bucket.backup.id
+  versioning_configuration { status = "Enabled" }
+}
+
+resource "aws_s3_bucket_server_side_encryption_configuration" "backup" {
+  bucket = aws_s3_bucket.backup.id
+  rule {
+    apply_server_side_encryption_by_default {
+      sse_algorithm     = "aws:kms"
+      kms_master_key_id = aws_kms_key.backup.arn
+    }
+    bucket_key_enabled = true    # дешевле: меньше вызовов KMS
+  }
+}
+
+resource "aws_s3_bucket_lifecycle_configuration" "backup" {
+  bucket = aws_s3_bucket.backup.id
+  rule {
+    id     = "tiering"
+    status = "Enabled"
+    filter {}
+    transition {
+      days          = 30
+      storage_class = "GLACIER_IR"
+    }
+    expiration { days = 365 }
+    noncurrent_version_expiration { noncurrent_days = 30 }
+  }
+}
+```
+Плюс для защиты от ransomware: **Object Lock** (compliance mode) и отдельный аккаунт для бэкапов. Проверка: `checkov -d .` / `trivy config .`.
+</details>
+
+### Задача 45. CI без долгоживущих ключей: OIDC GitHub → AWS
+
+<details><summary>▶️ Решение</summary>
+
+Trust policy роли — разрешаем только main-ветку конкретного репозитория:
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Principal": { "Federated": "arn:aws:iam::123456789012:oidc-provider/token.actions.githubusercontent.com" },
+    "Action": "sts:AssumeRoleWithWebIdentity",
+    "Condition": {
+      "StringEquals": {
+        "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
+        "token.actions.githubusercontent.com:sub": "repo:acme/api:ref:refs/heads/main"
+      }
+    }
+  }]
+}
+```
+Workflow:
+```yaml
+permissions: { id-token: write, contents: read }
+steps:
+  - uses: aws-actions/configure-aws-credentials@v4
+    with:
+      role-to-assume: arn:aws:iam::123456789012:role/gha-deploy
+      aws-region: eu-central-1
+  - run: aws sts get-caller-identity
+```
+**Ловушка:** условие `sub` через `StringLike: repo:acme/*` открывает роль любому репозиторию организации и любой ветке, включая PR из форков.
+</details>
+
+### Задача 46. FinOps-кейс: «счёт вырос с $18k до $31k»
+В Cost Explorer: EC2 +$2k, **EC2-Other +$9k**, S3 +$1k, CloudWatch +$1k. Где искать?
+
+<details><summary>▶️ Эталонный ход мысли</summary>
+
+1. **EC2-Other** — это NAT Gateway, межзональный трафик, EBS, снапшоты, Elastic IP. Детализируй по *Usage type*: `NatGateway-Bytes`, `DataTransfer-Regional-Bytes`.
+2. Типичная причина: новый сервис качает образы/данные из S3 или ECR через NAT → **Gateway VPC Endpoint** для S3 (бесплатный) и Interface Endpoints для ECR.
+3. Межзональный трафик: поды ходят в БД/кэш в другой AZ → topology-aware routing (`trafficDistribution: PreferClose`), реплики в каждой AZ.
+4. CloudWatch +$1k — обычно логи: кто-то включил debug → ретеншн и уровень логирования.
+5. Закрепить: теги `team`/`service` обязательны (SCP/Kyverno), бюджеты и **anomaly detection** с алертами, Kubecost для K8s.
+
+Оценка экономии вслух: «NAT стоит ~$0.045/ГБ; 100 ТБ/мес через NAT = ~$4.5k, endpoint для S3 убирает это полностью».
+</details>
+
+---
+
+<a id="p-sec"></a>
+
+## 🔐 DevSecOps
+
+### Задача 47. Security-гейт в CI
+Пайплайн должен падать на секретах в коде, на CRITICAL/HIGH CVE с доступным фиксом и на ошибках в Terraform.
+
+<details><summary>▶️ Решение</summary>
+
+```yaml
+name: security
+on: [pull_request]
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - name: Secrets
+        uses: gitleaks/gitleaks-action@v2
+        env: { GITHUB_TOKEN: "${{ secrets.GITHUB_TOKEN }}" }
+      - name: IaC
+        uses: aquasecurity/trivy-action@0.28.0
+        with: { scan-type: config, scan-ref: ./infra, exit-code: "1", severity: "HIGH,CRITICAL" }
+      - name: Build
+        run: docker build -t app:${{ github.sha }} .
+      - name: Image CVE
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: app:${{ github.sha }}
+          exit-code: "1"
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true          # не блокировать то, что нечем чинить
+          format: sarif
+          output: trivy.sarif
+      - uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with: { sarif_file: trivy.sarif }
+```
+Исключения — в `.trivyignore` с комментарием и сроком пересмотра. Версии actions в проде пинить по SHA.
+</details>
+
+### Задача 48. Секреты из Vault в K8s через External Secrets Operator
+
+<details><summary>▶️ Решение</summary>
+
+```yaml
+apiVersion: external-secrets.io/v1beta1
+kind: SecretStore
+metadata: { name: vault, namespace: prod }
+spec:
+  provider:
+    vault:
+      server: https://vault.internal:8200
+      path: kv
+      version: v2
+      auth:
+        kubernetes:                       # под аутентифицируется своим ServiceAccount
+          mountPath: kubernetes
+          role: prod-api
+          serviceAccountRef: { name: api }
+---
+apiVersion: external-secrets.io/v1beta1
+kind: ExternalSecret
+metadata: { name: api-db, namespace: prod }
+spec:
+  refreshInterval: 1h
+  secretStoreRef: { name: vault, kind: SecretStore }
+  target: { name: api-db }                # обычный K8s Secret, создаётся оператором
+  data:
+    - secretKey: DATABASE_PASSWORD
+      remoteRef: { key: prod/api/db, property: password }
+```
+В Git лежат только эти манифесты — без значений. Для ротации без рестарта пода: монтировать Secret как файл (обновится сам) или Reloader.
+</details>
+
+### Задача 49. Подпиши образ и запрети неподписанные
+
+<details><summary>▶️ Решение</summary>
+
+```bash
+cosign generate-key-pair                           # или keyless через OIDC в CI
+cosign sign --key cosign.key ghcr.io/acme/api@sha256:<digest>
+cosign verify --key cosign.pub ghcr.io/acme/api@sha256:<digest>
+syft ghcr.io/acme/api@sha256:<digest> -o cyclonedx-json > sbom.json
+cosign attest --key cosign.key --type cyclonedx --predicate sbom.json ghcr.io/acme/api@sha256:<digest>
+```
+```yaml
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata: { name: verify-signature }
+spec:
+  validationFailureAction: Enforce
+  webhookTimeoutSeconds: 30
+  rules:
+    - name: check-cosign
+      match: { any: [{ resources: { kinds: [Pod] } }] }
+      verifyImages:
+        - imageReferences: ["ghcr.io/acme/*"]
+          mutateDigest: true                     # тег → digest
+          attestors:
+            - entries:
+                - keys:
+                    publicKeys: |-
+                      -----BEGIN PUBLIC KEY-----
+                      ...
+                      -----END PUBLIC KEY-----
+```
+Подписывать **digest**, а не тег — тег можно перезаписать.
+</details>
+
+---
+
+<a id="p-sre"></a>
+
+## 🛡 SRE
+
+### Задача 50. Определи SLI/SLO и error budget policy
+Сервис: публичный API платежей. Сформулируй 2 SLI, SLO и что происходит при исчерпании бюджета.
+
+<details><summary>▶️ Пример ответа</summary>
+
+| SLI | Как считаем | SLO (28 дней) |
+|-----|-------------|---------------|
+| Доступность | доля ответов не-5xx на LB (исключая 429) | 99.95% |
+| Latency | доля запросов `POST /payments` быстрее 400 мс | 99% |
+
+```promql
+# SLI доступности
+1 - (sum(rate(http_requests_total{route="/payments",status=~"5.."}[28d]))
+     / sum(rate(http_requests_total{route="/payments"}[28d])))
+```
+**Error budget policy** (согласована с продуктом заранее):
+- бюджет < 50% → обязательный canary для всех релизов;
+- бюджет < 25% → только багфиксы и задачи надёжности;
+- бюджет исчерпан → фриз фич, топ action items постмортемов в приоритете, ревью с CTO;
+- один инцидент сжёг > 20% бюджета → обязательный постмортем.
+
+Измеряем на стороне клиента/LB, а не внутри приложения: падающий под не посчитает свои ошибки.
+</details>
+
+### Задача 51. Напиши runbook к алерту
+Алерт `PostgresReplicationLagHigh` (лаг > 60 с за 5 минут).
+
+<details><summary>▶️ Решение</summary>
+
+```markdown
+# Runbook: PostgresReplicationLagHigh
+**Влияние:** чтения с реплики отдают устаревшие данные; при failover возможна потеря данных (RPO).
+**Срочность:** P2 днём; P1, если лаг > 10 мин или растёт линейно.
+
+## Диагностика
+1. Дашборд «Postgres / Replication». Лаг растёт или стабилен?
+2. На primary: `SELECT client_addr, state, write_lag, replay_lag FROM pg_stat_replication;`
+3. На реплике: `SELECT now() - pg_last_xact_replay_timestamp();`
+4. Типичные причины:
+   - тяжёлая запись на primary (миграция, батч) → проверить `pg_stat_activity`;
+   - диск/CPU реплики упёрлись → `iostat`, метрики ноды;
+   - долгий запрос на реплике блокирует replay (`max_standby_streaming_delay`);
+   - сеть между AZ.
+
+## Действия
+- Батч/миграция → согласовать паузу с владельцем.
+- Долгий запрос на реплике → `SELECT pg_cancel_backend(pid)`.
+- Лаг > 10 мин → переключить чтение на primary (флаг `READ_FROM_REPLICA=false`).
+- Не помогло за 30 мин → эскалация: @db-oncall.
+
+## После
+Задача на постмортем, если влияние на пользователей было.
+```
+Хороший runbook отвечает на «что делать в 3 часа ночи», а не пересказывает документацию.
+</details>
+
+### Задача 52. Проведи game day
+Спланируй учения: что ломаем, гипотеза, критерии остановки.
+
+<details><summary>▶️ План</summary>
+
+| Эксперимент | Гипотеза | Как | Стоп-условие |
+|-------------|----------|-----|--------------|
+| Убить 1 из 3 подов API | 0 ошибок для клиентов | `kubectl delete pod` / Chaos Mesh `PodChaos` | 5xx > 1% |
+| Задержка 300 мс к Redis | p99 < 1 с, срабатывают таймауты | Chaos Mesh `NetworkChaos` delay | p99 > 3 с |
+| Отказ AZ | трафик уходит в 2 другие за < 2 мин | cordon + drain всех нод AZ, отключение подсети | SLO burn rate > 14 |
+| Failover БД | RTO < 60 с, без потери записей | `patronictl switchover` | ошибки > 2 мин |
+
+Порядок: staging → прод в низкую нагрузку → с дежурным и предупреждением поддержки. Результат — список находок с владельцами, как в постмортеме.
+</details>
+
+---
+
+<a id="p-sd"></a>
+
+## 🧩 System Design (mock-интервью)
+
+> Формат: 45 минут, напарник играет интервьюера и задаёт уточняющие вопросы. Оцени себя по критериям в конце каждой задачи.
+
+### Задача 53. Платформа для 30 команд разработчиков
+Компания переходит с ВМ на K8s. 150 сервисов, 30 команд, нужна self-service платформа.
+
+<details><summary>▶️ Каркас ответа</summary>
+
+1. **Уточнить:** облако или on-prem, требования compliance, текущий CI, сколько окружений, мульти-тенантность.
+2. **Кластеры:** prod / non-prod раздельно, namespace на команду+окружение, ResourceQuota/LimitRange, NetworkPolicy default deny.
+3. **Golden path:** шаблон сервиса (Backstage scaffolder) → репо с CI, Helm-чартом, дашбордами и алертами «из коробки».
+4. **Доставка:** GitHub Actions/GitLab CI собирают образ → Argo CD (ApplicationSet на команду) → canary через Argo Rollouts.
+5. **Политики:** Kyverno (без root, лимиты, подписанные образы), RBAC по группам из SSO.
+6. **Секреты:** Vault + ESO. **Observability:** OTel Collector → Prometheus/Mimir, Loki, Tempo; SLO-шаблоны.
+7. **Стоимость:** Kubecost, showback по namespace, Karpenter + spot для non-prod.
+8. **Миграция:** пилот на 2–3 командах, метрики DORA до/после.
+
+**Критерии:** ✅ спросил требования ✅ разделил платформу и приложения ✅ назвал self-service, а не «тикеты в DevOps» ✅ безопасность и стоимость ✅ план миграции.
+</details>
+
+### Задача 54. Деплой без даунтайма с переименованием колонки
+Нужно переименовать `users.name` → `users.full_name` в таблице на 200 млн строк, сервис работает 24/7.
+
+<details><summary>▶️ Каркас ответа</summary>
+
+Паттерн **expand → migrate → contract**, каждый шаг — отдельный релиз:
+1. `ALTER TABLE users ADD COLUMN full_name text;` (без DEFAULT — мгновенно).
+2. Релиз A: код пишет в **обе** колонки, читает из старой.
+3. Бэкфилл батчами по 10k строк с паузами (не одним `UPDATE` — блокировки, раздувание WAL, лаг реплик).
+4. Релиз B: читает из новой, пишет в обе.
+5. Релиз C: пишет только в новую. Наблюдаем неделю.
+6. `ALTER TABLE users DROP COLUMN name;`
+
+Каждый шаг откатывается независимо. Миграции — отдельной джобой (Helm hook / Argo sync wave), с `lock_timeout`, чтобы не повесить прод в очереди на блокировку.
+
+**Критерии:** ✅ две версии кода работают одновременно (rolling) ✅ батчи ✅ откат на каждом шаге ✅ блокировки и реплики.
+</details>
+
+### Задача 55. Мониторинг 50 кластеров в 3 регионах
+
+<details><summary>▶️ Каркас ответа</summary>
+
+1. **В каждом кластере:** Prometheus Agent / OTel Collector (сбор, без долгого хранения) + Fluent Bit/Alloy для логов.
+2. **Центр:** remote_write в Mimir/VictoriaMetrics cluster (multi-tenant, tenant = кластер), Loki, Tempo; объектное хранилище для долгого хранения.
+3. **Надёжность:** WAL у агентов на случай недоступности центра; алерты «нет данных от кластера» (`absent`/deadman switch во внешней системе).
+4. **Кардинальность:** лимиты на тенанта, relabeling, recording rules на краю.
+5. **Алертинг:** локальные критичные правила оцениваются в кластере (работают при разрыве связи), глобальные — в центре; Alertmanager в HA, маршрутизация по `team`.
+6. **Оценка:** 50 кластеров × 500k серий = 25M активных серий → ~ порядок размера кластера Mimir; стоимость хранения.
+
+**Критерии:** ✅ разделение сбора и хранения ✅ поведение при разрыве сети ✅ multi-tenancy и лимиты ✅ мониторинг самого мониторинга.
+</details>
+
+---
+
 ### ✅ Чек-лист готовности к практике
 
-- [ ] Решил все 40 задач руками хотя бы один раз
+- [ ] Решил все 55 задач руками хотя бы один раз
+- [ ] Прошёл блоки «🏋️ Практика модуля» во всех модулях 01–13
 - [ ] Могу за 10 минут написать Deployment + Service + Ingress с probes и ресурсами по памяти
 - [ ] Могу за 10 минут написать multi-stage Dockerfile
 - [ ] Могу за 15 минут написать пайплайн CI с тестами, сборкой и деплоем
 - [ ] Знаю наизусть 5 запросов PromQL
 - [ ] Могу рассказать порядок действий при любом инциденте из этого раздела
+- [ ] Могу за 5 минут посчитать error budget и burn rate
+- [ ] Могу объяснить, как удалить секрет из истории Git и что сделать **до** этого
+- [ ] Провёл хотя бы 2 mock-интервью по System Design с напарником
 
 
 ---
