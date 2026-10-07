@@ -251,6 +251,18 @@ journalctl -xe
 
 > 🎯 «Сервер тормозит, что делаешь?» — назови «60 секунд Брендана Грегга»: `uptime, dmesg, vmstat, mpstat, pidstat, iostat, free, sar -n DEV, sar -n TCP, top`.
 
+## Диски, монтирование и время на сервере
+
+- Цепочка хранения: диск → раздел → LVM PV/VG/LV (если используется) → файловая система → точка монтирования. Увеличение диска не означает автоматическое расширение всех следующих слоёв.
+- Перед изменениями: `lsblk -f`, `findmnt`, `df -hT`, для LVM — `pvs`, `vgs`, `lvs`. Сначала определи нужное устройство, тип ФС и наличие проверенной копии данных.
+- Для ext4 и XFS различаются инструменты расширения; возможность увеличения не означает возможность уменьшения. Не применяй команду для одного типа ФС к другому.
+- `/etc/fstab`: UUID, опции, зависимости загрузки. `findmnt --verify --verbose` помогает проверить конфигурацию до перезагрузки.
+- RAID повышает доступность при определённых отказах дисков, но не заменяет бэкап. Снапшот может зависеть от исходного хранилища и не гарантирует согласованность приложения.
+- NFS: зависание сетевого хранилища может дать D-state и высокий load average; проверь mount options, сервер и сеть до попытки перезапускать всё приложение.
+- Время: `timedatectl status`, при установленном chrony — `chronyc tracking` и `chronyc sources -v`. Рассинхронизация мешает TLS, аутентификации и сопоставлению логов.
+
+**Практика в отдельной ВМ:** добавь пустой виртуальный диск, создай учебный том, запиши контрольный файл, увеличь диск и файловую систему. Критерий: `df` видит новый размер, контрольная сумма файла не изменилась, после перезагрузки mount восстановлен. Перед экспериментом запиши схему дисков и план отката.
+
 ## Полезные однострочники
 
 ```bash
@@ -464,6 +476,34 @@ iptables -L -n -v ; nft list ruleset
 7. **Что такое anycast?** — Один IP анонсируется из многих точек (CDN, DNS 1.1.1.1).
 8. **Как проверить, открыт ли порт?** — `nc -zv`, `ss`, `telnet`, `curl`.
 
+## Сеть: от симптома к проверяемой гипотезе
+
+| Симптом | Что проверить | Что нельзя заключать по одному признаку |
+|---------|---------------|-----------------------------------------|
+| `Connection refused` | RST/REJECT в захвате, слушающий адрес и порт | Отказ мог вернуть firewall, а не приложение |
+| Таймаут TCP | Маршрут туда и обратно, потери, фильтрацию, SYN/SYN-ACK | Таймаут не доказывает наличие firewall |
+| TCP работает, TLS зависает | MTU/PMTUD, MSS, retransmissions, proxy и серверный TLS | Успешный маленький ping не проверяет весь путь |
+| По IP работает, по имени нет | DNS-ответ, TTL, search domains, IPv4/IPv6, SNI | Запрос HTTPS к IP может менять проверку сертификата |
+| Новые соединения падают, старые живут | conntrack, ephemeral ports, backlog, лимиты FD | Причина не обязательно в DNS |
+
+```bash
+ip route get 10.0.0.5                 # выбор маршрута и source IP
+ip rule show                         # policy routing: не только default route
+ss -s
+ss -tin                              # TCP: RTT, retransmissions, congestion state
+tracepath example.com                # подсказки о path MTU; нужен пакет tracepath
+curl -4 -v --max-time 10 https://example.com
+curl -6 -v --max-time 10 https://example.com
+# Если используется Linux conntrack, сравнить занятость и лимит:
+sysctl net.netfilter.nf_conntrack_count net.netfilter.nf_conntrack_max
+```
+
+**MTU** на IP-интерфейсе ограничивает размер IP-пакета без фрагментации, а **MSS** — полезные данные TCP-сегмента. При PMTUD важны ICMP-сообщения о слишком большом пакете; в IPv6 маршрутизаторы не фрагментируют пакеты. Уменьшение MTU без диагностики может лишь скрыть проблему.
+
+**Практика:** в изолированном стенде воспроизведи недоступный порт и ошибочный DNS-ответ. Для каждого случая сохрани `curl -v`, выбранный маршрут и короткий packet capture. Успех — объяснить, на каком шаге ломается соединение и какое наблюдение подтверждает причину.
+
+Тайминги `curl` считаются от начала запроса: для простого HTTPS-запроса без редиректов/повторного использования соединения TCP ≈ `time_connect - time_namelookup`, TLS ≈ `time_appconnect - time_connect`. `time_starttransfer - time_appconnect` включает отправку запроса, сеть и работу сервера, а не только вычисления приложения. [curl write-out](https://curl.se/docs/manpage.html#-w).
+
 
 ## 🏋️ Практика модуля
 
@@ -499,7 +539,7 @@ Flags [S]    клиент → сервер   SYN
 Flags [S.]   сервер → клиент   SYN-ACK
 Flags [F.]   ...               FIN (закрытие, 4 сегмента: FIN/ACK/FIN/ACK)
 ```
-Если вместо `[S.]` приходит `[R.]` — порт закрыт (RST). Если ответа нет вообще — пакет режет файрвол (DROP) → клиент получит таймаут, а не «connection refused».
+Если вместо `[S.]` приходит `[R.]` — порт закрыт (RST). Если ответа нет — возможны фильтрация, потери, ошибка маршрута или недоступность хоста; по одному таймауту причину не определить.
 </details>
 
 **2.3. Файрвол на nftables: разрешить только SSH и HTTPS**
@@ -939,6 +979,48 @@ kubectl drain node --ignore-daemonsets --delete-emptydir-data
 - **Helm** — шаблонизатор + менеджер релизов (`install/upgrade/rollback`, values, charts в OCI-реестре).
 - **Kustomize** — патчи над базовыми манифестами (overlays dev/stage/prod), встроен в kubectl.
 
+## Постоянные данные: PV, PVC и CSI
+
+| Понятие | Что объяснить на интервью |
+|---------|--------------------------|
+| PV / PVC | PV представляет хранилище, PVC описывает запрос приложения на него |
+| StorageClass / CSI | Класс задаёт provisioner и параметры; CSI-драйвер выполняет операции с томом |
+| RWO / RWX / RWOP | ReadWriteOnce: запись с одной ноды, возможны несколько подов на ней; ReadWriteMany: с нескольких нод; ReadWriteOncePod: один под при поддержке CSI |
+| `reclaimPolicy` | `Delete` может удалить хранилище после освобождения PV; `Retain` оставляет данные для ручного восстановления |
+| `WaitForFirstConsumer` | Выбор/создание тома откладывается до планирования потребителя, чтобы учесть топологию |
+| Расширение PVC | Нужны `allowVolumeExpansion` и поддержка драйвера/ФС; уменьшение PVC не является обратной операцией |
+
+**PVC Pending:** `kubectl describe pvc` → существует ли StorageClass → события provisioner → квота/ёмкость → access mode → топология. При `WaitForFirstConsumer` ожидание до появления подходящего Pod может быть нормальным.
+
+**Pod Pending/ContainerCreating:** отдельно проверь binding PVC, zone/node affinity, `VolumeAttachment`, ошибки attach/mount и логи CSI. Перенос Pod на другую ноду не переносит локальные данные автоматически. StatefulSet даёт идентичность и привязку томов, но сам не настраивает репликацию БД.
+
+**Практика: PVC с несуществующим StorageClass.** Нужен отдельный учебный кластер; манифест сохранён в `pvc-lab.yaml`:
+
+```yaml
+apiVersion: v1
+kind: Namespace
+metadata: { name: storage-lab }
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: { name: data, namespace: storage-lab }
+spec:
+  storageClassName: deliberately-missing
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests: { storage: 128Mi }
+```
+
+```bash
+kubectl apply -f pvc-lab.yaml
+kubectl -n storage-lab describe pvc data
+kubectl get storageclass
+```
+
+Ожидается Pending и событие об отсутствующем классе. Выбери существующий класс, удали **только этот пустой учебный PVC**, исправь файл и создай заново: `storageClassName` нельзя произвольно менять у существующего claim. Если классов нет, сначала установи provisioner для стенда. При `WaitForFirstConsumer` создай Pod, монтирующий claim.
+
+Критерий: PVC Bound, Pod пишет файл в том; после пересоздания Pod с тем же claim файл читается. Перед очисткой `kubectl delete namespace storage-lab` проверь `reclaimPolicy`: очистка удаляет учебные данные. Снапшот тома и бэкап приложения оценивай отдельно. [Документация Persistent Volumes](https://kubernetes.io/docs/concepts/storage/persistent-volumes/).
+
 ## Операторы и CRD
 CRD расширяет API, оператор — контроллер, автоматизирующий знания администратора (CloudNativePG, Strimzi, Prometheus Operator).
 
@@ -955,7 +1037,7 @@ CRD расширяет API, оператор — контроллер, авто�
 7. Как под на одной ноде достучится до пода на другой? — CNI: overlay (VXLAN/Geneve) или маршрутизация (BGP), eBPF.
 8. Как работает Service под капотом? — kube-proxy пишет iptables/IPVS-правила DNAT на IP подов.
 9. Почему Secret небезопасен по умолчанию и как защитить?
-10. Как сделать zero-downtime деплой? — readiness, `maxUnavailable: 0`, preStop sleep, graceful shutdown, PDB.
+10. Как сделать zero-downtime деплой? — readiness, `maxUnavailable: 0`, запас ресурсов, graceful shutdown и проверка под нагрузкой. PDB нужен отдельно для выселений через Eviction API.
 11. Ingress vs Gateway API?
 12. Что такое оператор?
 13. Как бэкапить кластер? — etcd snapshot + Velero для ресурсов и PV.
@@ -1114,7 +1196,7 @@ jobs:
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        with: { registry: ghcr.io, username: ${{ github.actor }}, password: ${{ secrets.GITHUB_TOKEN }} }
+        with: { registry: ghcr.io, username: "${{ github.actor }}", password: "${{ secrets.GITHUB_TOKEN }}" }
       - uses: docker/build-push-action@v6
         with:
           push: ${{ github.ref == 'refs/heads/main' }}
@@ -1150,6 +1232,20 @@ jobs:
 ## Секреты в CI
 - Masked/protected переменные, OIDC, Vault, никаких секретов в логах и в образе.
 - Отдельные runner'ы для прода, минимальные права.
+
+## GitLab CI: почему корректный YAML ещё не означает рабочий деплой
+
+- `workflow: rules` управляет созданием pipeline, job `rules` — включением задания. Проверяй push, MR и tag отдельно, чтобы не получать дублирующие pipeline.
+- **Cache** ускоряет повторную работу и может отсутствовать. **Artifacts** передают результат конкретного задания. Образ/пакет для релиза нельзя восстанавливать только из ненадёжного кэша.
+- `needs` задаёт зависимости DAG. Убедись, что нужные artifacts передаются, а optional job не делает обязательную зависимость невыполнимой.
+- Runner: tags, executor, доступ к registry/кластеру, диск, CA и Docker-in-Docker. Privileged runner выполняет код с высокими правами; отделяй доверенные release jobs от непроверенных MR.
+- Protected variables могут быть недоступны в MR/неprotected ветке. Не выводи секрет целиком для диагностики: проверь факт наличия и область применения.
+- `resource_group: production` сериализует задания выкладки **в пределах проекта**. Порядок очереди и блокировка устаревших deployment jobs — отдельные настройки. Общий ресурс между проектами требует общей точки координации.
+- `interruptible: true` полезен для отменяемых проверок; применимость отмены миграции/деплоя нужно оценивать отдельно.
+
+**Практика:** запусти два pipeline для учебного environment, задержав deploy старого коммита. Зафиксируй SHA реально развёрнутой версии. Добавь `resource_group`, настрой политику устаревших выкладок и повтори: в итоге должна остаться нужная новая версия, а не просто исчезнуть параллельность.
+
+Документация: [resource groups и режимы очереди](https://docs.gitlab.com/ci/resource_groups/), [защита от устаревших деплоев](https://docs.gitlab.com/ci/environments/deployment_safety/).
 
 ## Метрики DORA
 1. **Deployment frequency** — частота выкладок.
@@ -1289,16 +1385,33 @@ terraform destroy
 ### Ключевые понятия
 ```hcl
 terraform {
-  required_version = ">= 1.9"
-  required_providers { aws = { source = "hashicorp/aws", version = "~> 5.0" } }
-  backend "s3" { bucket = "tf-state" key = "prod/net.tfstate" region = "eu-central-1" use_lockfile = true }
+  required_version = ">= 1.10"
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }
+  }
+  backend "s3" {
+    bucket       = "tf-state"
+    key          = "prod/net.tfstate"
+    region       = "eu-central-1"
+    use_lockfile = true
+  }
 }
 
 variable "env" { type = string }
 
 locals { tags = { env = var.env, owner = "platform" } }
 
-data "aws_ami" "ubuntu" { most_recent = true owners = ["099720109477"] filter { name = "name" values = ["ubuntu/images/*24.04*amd64*"] } }
+data "aws_ami" "ubuntu" {
+  most_recent = true
+  owners      = ["099720109477"]
+  filter {
+    name   = "name"
+    values = ["ubuntu/images/*24.04*amd64*"]
+  }
+}
 
 resource "aws_instance" "web" {
   for_each      = toset(["a", "b"])
@@ -1363,7 +1476,7 @@ Pulumi (IaC на TS/Python/Go), Crossplane (IaC через K8s CRD), CloudFormat
 7. Что такое drift и как с ним бороться?
 8. Terraform vs OpenTofu?
 9. Идемпотентность в Ansible?
-10. Как хранить секреты в Terraform? — не в коде; Vault provider, SM, `sensitive = true`, шифрование state.
+10. Как хранить секреты в Terraform? — не в коде; Vault provider, SM, `sensitive = true` для сокрытия вывода, шифрование state. `sensitive` не удаляет значение из state.
 
 
 ## 🏋️ Практика модуля
@@ -1392,11 +1505,20 @@ resource "local_file" "u" {
   filename = "${path.module}/out/${each.key}.txt"
   content  = each.key
 }
-moved { from = local_file.u[0] to = local_file.u["alice"] }
-moved { from = local_file.u[1] to = local_file.u["bob"] }
-moved { from = local_file.u[2] to = local_file.u["carol"] }
+moved {
+  from = local_file.u[0]
+  to   = local_file.u["alice"]
+}
+moved {
+  from = local_file.u[1]
+  to   = local_file.u["bob"]
+}
+moved {
+  from = local_file.u[2]
+  to   = local_file.u["carol"]
+}
 ```
-`terraform plan` → `0 to add, 0 to destroy`. Теперь удаление `bob` трогает только `bob`.
+Перед рефакторингом верни исходный список из трёх пользователей: сначала перенеси адреса ресурсов с `0 to add, 0 to destroy`, затем удали `bob` отдельным изменением. Его удаление должно затронуть только `bob`. Если уже применял удаление из списка с `count`, сначала сверь фактические адреса в state: приведённая карта `moved` рассчитана на исходное состояние.
 </details>
 
 **7.2. Сделай Ansible-задачу идемпотентной**
@@ -1431,14 +1553,17 @@ moved { from = local_file.u[2] to = local_file.u["carol"] }
 <details><summary>▶️ Решение</summary>
 
 ```bash
-terraform plan -detailed-exitcode -lock=false -input=false
-case $? in
+set -euo pipefail
+plan_status=0
+terraform plan -detailed-exitcode -input=false -lock-timeout=60s || plan_status=$?
+case "$plan_status" in
   0) echo "Нет изменений" ;;
   1) echo "Ошибка plan"; exit 1 ;;
-  2) echo "DRIFT обнаружен"; ./notify-slack.sh; exit 2 ;;
+  2) echo "Обнаружены изменения: требуется разбор plan"; exit 2 ;;
+  *) echo "Неожиданный код Terraform: $plan_status" >&2; exit "$plan_status" ;;
 esac
 ```
-Запускать по расписанию (nightly) для каждого стейта. Только чтение облака — отдельная роль с read-only правами.
+Код 2 обрабатывается явно и не теряется из-за `set -e`. Он означает непустой plan: причиной может быть drift, изменение конфигурации или обновление зависимостей. Для сравнения используй ожидаемый commit и lock-файл провайдеров; `plan -refresh-only` помогает выделить изменения объектов вне Terraform. Запускай по расписанию для каждого state: отдельная роль на чтение инфраструктуры плюс необходимые права backend/lock. По умолчанию не отключай блокировку.
 </details>
 
 🔗 Больше задач: [Практикум №29–32](#p-iac) — модуль VPC, `moved`/`import`, remote state, Ansible-роль.
@@ -1681,6 +1806,60 @@ groups:
 ## Grafana
 Дашборды, алерты, источники данных (Prometheus, Loki, Tempo, ClickHouse). Дашборды как код (Grafonnet, provisioning, Terraform). Стек **LGTM**: Loki, Grafana, Tempo, Mimir.
 
+## Проверка мониторинга от метрики до уведомления
+
+1. Приложение отдаёт метрику; target успешно собирается.
+2. PromQL возвращает ожидаемые серии и лейблы. `up == 0` ловит неудачный scrape существующего target; исчезнувший из discovery target требует отдельной проверки отсутствия данных.
+3. Правило переходит `inactive → pending → firing` после `for`. Проверь также поведение при нулевом трафике и исчезновении серии ошибок.
+4. Prometheus отправляет алерт в Alertmanager. Проверяются route, grouping, inhibition, silence и конфигурация receiver.
+5. Получатель действительно получает уведомление; после восстановления приходит resolved, если это настроено.
+6. Для отказа самого мониторинга нужен независимый контроль, например внешний heartbeat/dead man's switch.
+
+**Практика без отправки сообщений:** создай два файла и проверь правило через `promtool` той же версии, что Prometheus на стенде.
+
+`alerts-lab.yml`:
+
+```yaml
+groups:
+  - name: lab
+    rules:
+      - alert: LabTargetDown
+        expr: up{job="lab"} == 0
+        for: 2m
+        labels: { severity: warning }
+```
+
+`alerts-lab.test.yml`:
+
+```yaml
+rule_files: [alerts-lab.yml]
+evaluation_interval: 1m
+tests:
+  - interval: 1m
+    input_series:
+      - series: 'up{job="lab",instance="demo:8080"}'
+        values: '1 0 0 0 1'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: LabTargetDown
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: LabTargetDown
+        exp_alerts:
+          - exp_labels: { job: lab, instance: 'demo:8080', severity: warning }
+            exp_annotations: {}
+      - eval_time: 4m
+        alertname: LabTargetDown
+        exp_alerts: []
+```
+
+```bash
+promtool check rules alerts-lab.yml
+promtool test rules alerts-lab.test.yml
+```
+
+Критерий: все три проверки проходят — до выдержки алерта нет, после выдержки он есть, после восстановления исчезает. Это проверка правила, а не доставки уведомления. Для end-to-end проверки используй отдельный учебный receiver, согласованный с получателем. [Тестирование правил Prometheus](https://prometheus.io/docs/prometheus/latest/configuration/unit_testing_rules/).
+
 ## ❓ Вопросы
 1. Pull vs push модель мониторинга?
 2. Типы метрик Prometheus, histogram vs summary?
@@ -1841,8 +2020,12 @@ awk '$9 ~ /^5/ {print $1}' access.log | sort | uniq -c | sort -rn | head -5
 **2. Проверить список URL и вывести недоступные**
 ```bash
 while read -r url; do
-  code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$url")
-  [[ $code =~ ^2|^3 ]] || echo "$url -> $code"
+  [[ -z $url ]] && continue
+  if code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 5 "$url"); then
+    [[ $code =~ ^[23][0-9]{2}$ ]] || echo "$url -> HTTP $code"
+  else
+    echo "$url -> ошибка соединения/TLS/таймаут" >&2
+  fi
 done < urls.txt
 ```
 
@@ -1852,26 +2035,42 @@ df -P | awk 'NR>1 && int($5) > 80 {print $6, $5}'
 ```
 
 **4. Ротация бэкапов: оставить последние 7**
-```bash
-ls -1t /backup/db-*.sql.gz | tail -n +8 | xargs -r rm --
+```python
+from pathlib import Path
+
+backups = sorted(Path("/backup").glob("db-*.sql.gz"),
+                 key=lambda p: p.stat().st_mtime_ns, reverse=True)
+for backup in backups[7:]:
+    print(backup)  # сначала проверить список; затем заменить на backup.unlink()
 ```
 
 ## Python для DevOps
 
 ```python
 #!/usr/bin/env python3
-"""Найти поды не в Running и вывести причину."""
-import json, subprocess, sys
+"""Найти проблемные Pod: фаза, Ready и состояние контейнеров."""
+import json, subprocess
 
 out = subprocess.run(["kubectl", "get", "pods", "-A", "-o", "json"],
                      capture_output=True, text=True, check=True).stdout
 for p in json.loads(out)["items"]:
-    phase = p["status"]["phase"]
-    if phase != "Running":
-        reasons = [cs.get("state", {}).get("waiting", {}).get("reason")
-                   for cs in p["status"].get("containerStatuses", [])]
-        print(f'{p["metadata"]["namespace"]}/{p["metadata"]["name"]}: {phase} {reasons}')
+    status = p.get("status", {})
+    phase = status.get("phase", "Unknown")
+    if phase == "Succeeded":
+        continue
+    containers = (status.get("initContainerStatuses", [])
+                  + status.get("containerStatuses", []))
+    reasons = [cs.get("state", {}).get("waiting", {}).get("reason")
+               for cs in containers]
+    reasons = [reason for reason in reasons if reason]
+    ready = any(c.get("type") == "Ready" and c.get("status") == "True"
+                for c in status.get("conditions", []))
+    if phase != "Running" or not ready or reasons:
+        print(f'{p["metadata"]["namespace"]}/{p["metadata"]["name"]}: '
+              f'{phase} ready={ready} {reasons}')
 ```
+
+`CrashLoopBackOff` — состояние ожидания контейнера, а не отдельная фаза Pod. Pod может иметь фазу Running и не быть Ready. Pending без `containerStatuses` тоже должен попадать в отчёт.
 
 **Парсинг логов с collections.Counter**
 ```python
@@ -2544,6 +2743,140 @@ CKA, CKAD, CKS (Kubernetes); AWS SAA / DevOps Pro; HashiCorp Terraform Associate
 
 ---
 
+<a id="m16"></a>
+
+# 16. PostgreSQL, Redis и очереди в эксплуатации
+
+## PostgreSQL: что проверить при деградации
+
+1. Установить масштаб: подключение, отдельный запрос или вся БД; сопоставить время с релизами, батчами и изменением нагрузки.
+2. Проверить CPU, память, диск, число соединений и ожидания. Увеличение `max_connections` не устраняет причину перегрузки; пул соединений приложения и PgBouncer тоже имеют пределы.
+3. Найти блокирующие транзакции, долгие запросы и `idle in transaction`. Сначала определить владельца и последствия отмены.
+4. Проверить планы и статистику, autovacuum, размер таблиц/индексов, рост WAL и репликационный лаг.
+
+```sql
+-- Запросы и ожидания текущих клиентских соединений.
+-- Для обзора чужих сессий нужны подходящие права мониторинга.
+SELECT pid, usename, state, wait_event_type, wait_event,
+       now() - xact_start AS transaction_age,
+       pg_blocking_pids(pid) AS blockers,
+       left(query, 160) AS query
+FROM pg_stat_activity
+WHERE backend_type = 'client backend' AND pid <> pg_backend_pid()
+ORDER BY xact_start NULLS LAST;
+```
+
+**Ловушки:** `EXPLAIN ANALYZE` действительно выполняет запрос, включая изменение данных. План изучают с учётом нагрузки и побочных эффектов. Отмена запроса (`pg_cancel_backend`) и завершение соединения (`pg_terminate_backend`) различаются по последствиям. `pg_stat_statements` нужно предварительно настроить; история запросов не появляется задним числом.
+
+## Бэкапы, репликация и восстановление
+
+- Логический dump переносит объекты и данные; глобальные роли кластера требуют отдельного учёта.
+- PITR требует базовой физической копии и непрерывного архива WAL до точки восстановления. Один `pg_dump` этого не обеспечивает.
+- Репликация переносит и ошибочные изменения. Реплика не заменяет независимый бэкап.
+- RPO/RTO проверяют восстановлением и измерением времени, а не только наличием файла в бакете.
+- При оценке replication lag учитывай активность primary: давнее время последней воспроизведённой транзакции на простаивающей БД само по себе не доказывает отставание.
+
+Документация: [SQL dump](https://www.postgresql.org/docs/current/backup-dump.html), [PITR](https://www.postgresql.org/docs/current/continuous-archiving.html), [статистика и ожидания](https://www.postgresql.org/docs/current/monitoring-stats.html).
+
+## Практика: восстановить данные после ошибочного TRUNCATE
+
+Нужны Bash и Docker. Выполняй блоки в одной shell-сессии. Стенд не публикует порты; пароль учебный, данные контейнера временные. Образ должен быть доступен локально или скачиваться из registry.
+
+```bash
+set -euo pipefail
+PG_LAB="interview-pg-$(date +%s)-$$"
+LAB_DIR=$(mktemp -d)
+docker run -d --name "$PG_LAB" --network none \
+  --mount type=tmpfs,destination=/var/lib/postgresql/data \
+  -e POSTGRES_PASSWORD=lab-only -e POSTGRES_DB=lab postgres:16-alpine
+
+for attempt in {1..60}; do
+  if docker exec "$PG_LAB" pg_isready -h 127.0.0.1 -U postgres -d lab >/dev/null 2>&1; then
+    break
+  fi
+  sleep 1
+done
+docker exec "$PG_LAB" pg_isready -h 127.0.0.1 -U postgres -d lab
+
+docker exec -i "$PG_LAB" psql -U postgres -d lab -v ON_ERROR_STOP=1 <<'SQL'
+CREATE TABLE orders (id integer PRIMARY KEY, amount integer NOT NULL);
+INSERT INTO orders VALUES (1, 100), (2, 200);
+SQL
+
+docker exec "$PG_LAB" pg_dump -U postgres -d lab -Fc > "$LAB_DIR/lab.dump"
+docker exec "$PG_LAB" psql -U postgres -d lab -v ON_ERROR_STOP=1 \
+  -c 'TRUNCATE orders;'
+```
+
+Восстанови копию в **другую** БД и проверь содержимое:
+
+```bash
+docker exec "$PG_LAB" createdb -U postgres restored
+docker exec -i "$PG_LAB" pg_restore -U postgres -d restored \
+  --no-owner --no-acl --exit-on-error < "$LAB_DIR/lab.dump"
+
+actual=$(docker exec "$PG_LAB" psql -U postgres -d restored -At -v ON_ERROR_STOP=1 \
+  -c "SELECT string_agg(id::text || ':' || amount::text, ',' ORDER BY id) FROM orders;")
+test "$actual" = '1:100,2:200'
+docker exec "$PG_LAB" psql -U postgres -d lab -At -c 'SELECT count(*) FROM orders;'
+```
+
+Критерий: в исходной БД 0 строк, в восстановленной ровно две ожидаемые записи; восстановление завершилось без SQL-ошибок. Зафиксируй длительность и объясни, какие записи потерялись бы между dump и инцидентом. Это логическое восстановление, не PITR и не проверка восстановления после полной потери сервера.
+
+Очистка после проверки: `docker rm -f "$PG_LAB"`. Dump остаётся в `$LAB_DIR` для изучения; после работы удали именно созданный учебный файл. Для следующего упражнения запусти новый стенд.
+
+## Redis: кэш или хранилище данных?
+
+- Сначала определи, можно ли потерять ключи и восстановить их из источника данных.
+- `maxmemory` и eviction policy определяют поведение при нехватке памяти: удаление ключей или отказ в новых записях. TTL решает другую задачу.
+- RDB сохраняет снимки, AOF — журнал операций. Частота сохранения/fsync влияет на возможную потерю данных и нагрузку.
+- Репликация и автоматическое переключение не заменяют независимые копии. После отказа приложения должны переподключиться к актуальному primary.
+- Наблюдай latency, hit/miss, evictions, память и медленные команды. Массовое истечение TTL может создать всплеск запросов к БД.
+
+**Практика в отдельном Redis:** установи лимит памяти, заполни тестовыми ключами, сравни `noeviction` и подходящую eviction policy. Критерий: объяснить разницу между отказом записи и удалением ключей, подтвердить её через `INFO memory`/`INFO stats`. Затем проверь восстановление с выбранной persistence-конфигурацией. [Redis persistence](https://redis.io/docs/latest/operate/oss_and_stack/management/persistence/).
+
+## Очереди: доставка не равна успешной обработке
+
+- RabbitMQ: publisher confirms подтверждают приём брокером; consumer acknowledgements сообщают о завершении обработки потребителем. Это разные участки пути.
+- Сбой между выполнением операции и подтверждением может привести к повторной доставке. Обработчику нужна идемпотентность, например уникальный `event_id` и атомарная фиксация результата.
+- Ограничивай число повторов, используй задержку и DLQ для сообщений, которые постоянно ломают обработчик.
+- Kafka: разбери partition, consumer group, offsets, rebalance и consumer lag. Порядок гарантируется в рамках partition; commit offset сам по себе не подтверждает запись результата во внешнюю БД.
+- Наблюдай возраст старейшего сообщения, скорость поступления/обработки и число повторов; длина очереди без контекста недостаточна.
+
+**Практика:** останови consumer после записи результата, но до ack/commit offset. Перезапусти его и докажи, что повторная доставка не создаёт второй бизнес-эффект. Критерий: сообщение обработано, результат один, повтор зафиксирован; неисправимое сообщение после ограниченного числа попыток попадает в DLQ. [RabbitMQ acknowledgements и confirms](https://www.rabbitmq.com/docs/confirms).
+
+## Вопросы для самопроверки
+
+1. Бэкап создаётся каждую ночь. Как доказать, что его можно восстановить?
+2. Почему реплика не спасает от случайного `DELETE`?
+3. Что проверить до увеличения пула соединений с PostgreSQL?
+4. Как отличить блокировку запроса от нехватки CPU?
+5. Что произойдёт при исчерпании памяти Redis с выбранной policy?
+6. Как обработать повторную доставку платежного события без повторного списания?
+
+---
+
+<a id="lab-guide"></a>
+
+# Как запускать практику и проверять результат
+
+Примеры бывают двух видов: самостоятельная лабораторная и фрагмент конфигурации для адаптации. `registry.example.com`, `my-org`, `<PID>`, имена бакетов и отсутствующий код приложения — placeholders, которые нужно заменить. Указание образа `ghcr.io/example/app:1.0` не означает, что такой образ существует.
+
+**Проверка примеров, 8 октября 2026:** лабораторная восстановления из модуля 16 выполнена на `postgres:16-alpine`; тест алерта выполнен `promtool` из `prom/prometheus:v3.0.1`; HCL-блоки разобраны Terraform 1.16.5. Скрипты проверены на ошибках dump/выгрузки и кодах plan, отчёт по подам — на семи фикстурах. Эти проверки не заменяют запуск облачных ресурсов, CI/CD и Kubernetes-заданий в выбранном окружении.
+
+- Перед заданием запиши версии инструментов, нужные зависимости, контекст Kubernetes, namespace и используемый аккаунт облака.
+- Linux-задания с firewall, дисками, `sudo` и лимитами выполняй в отдельной ВМ. Контейнер не полностью воспроизводит systemd, загрузку и диски обычного сервера.
+- Для Kubernetes используй отдельный kind/minikube-кластер. Для NetworkPolicy нужен поддерживающий её CNI, для PVC — provisioner, для HPA — источник метрик.
+- У каждого задания фиксируй: исходный симптом → гипотезу → команду проверки → наблюдение → исправление → повторную проверку → очистку.
+- Проверяй пользовательский результат: HTTP-запрос, восстановленные данные, полученное уведомление. Статусы Running и «pipeline зелёный» сами по себе недостаточны.
+- Для повторения отвечай по схеме: определение за минуту → механизм → конкретный пример → ограничения → уточняющий вопрос интервьюера.
+
+**Сквозной проект:** один API с PostgreSQL и Redis → Compose → CI со сборкой одного образа → Kubernetes → метрики и алерт → восстановление БД → намеренно сломанный релиз и откат. Репозиторий пока содержит задания и фрагменты; готового приложения и единой команды запуска проекта здесь нет.
+
+Самооценка по каждой теме: `0` — не объясняю, `1` — объясняю с подсказкой, `2` — выполняю по инструкции, `3` — диагностирую новую поломку и объясняю ограничения. Сначала повторяй темы с низкой оценкой, необходимые для выбранной вакансии.
+
+---
+
 <a id="practice"></a>
 
 # 🏋️ Практикум: 55 задач с решениями
@@ -2761,7 +3094,7 @@ curl -o /dev/null -s -w @curl-format.txt https://github.com
 ```bash
 # На клиенте
 ping -c3 10.0.0.5              # L3 (ICMP может быть закрыт — это не приговор)
-nc -zv -w3 10.0.0.5 8080       # TCP: refused = хост жив, порт закрыт; timeout = фильтрует файрвол
+nc -zv -w3 10.0.0.5 8080       # TCP: refused = хост жив, порт закрыт; timeout = нет ответа; проверить маршрут, потери и фильтрацию
 traceroute -T -p 8080 10.0.0.5
 # На сервере
 ss -ltnp | grep 8080           # слушает? на 127.0.0.1 или 0.0.0.0?
@@ -3089,7 +3422,7 @@ kubectl delete pod big
 
 ### Задача 20. Service не отвечает
 ```bash
-kubectl create deployment api --image=nginx --replicas=2
+kubectl create deployment api --image=nginx --replicas=2 --port=80
 kubectl expose deployment api --port=80 --target-port=8080
 kubectl run tmp --rm -it --image=curlimages/curl -- curl -m3 http://api
 ```
@@ -3110,6 +3443,8 @@ kubectl patch svc api -p '{"spec":{"ports":[{"port":80,"targetPort":80}]}}'
 
 ```bash
 kubectl create deployment web --image=nginx:1.26 --replicas=4
+kubectl patch deployment web --type=merge -p '{"spec":{"strategy":{"rollingUpdate":{"maxUnavailable":0,"maxSurge":1}},"template":{"spec":{"containers":[{"name":"nginx","image":"nginx:1.26","readinessProbe":{"httpGet":{"path":"/","port":80},"periodSeconds":2}}]}}}}'
+kubectl rollout status deploy/web --timeout=120s
 kubectl set image deploy/web nginx=nginx:1.27
 kubectl rollout status deploy/web
 kubectl rollout history deploy/web
@@ -3118,7 +3453,7 @@ kubectl rollout status deploy/web --timeout=60s           # зависнет
 kubectl rollout undo deploy/web
 kubectl annotate deploy/web kubernetes.io/change-cause="rollback after bad image"
 ```
-Благодаря `maxUnavailable` старые поды не удаляются, пока новые не стали Ready, поэтому сломанный образ не уронил сервис.
+При явно заданном `maxUnavailable: 0` и здоровых исходных репликах контроллер сохраняет доступные старые поды, пока новые не готовы. Нужны ресурсы для `maxSurge`. Успешный rollout не доказывает отсутствие ошибок запросов: отдельно проверь Service непрерывной нагрузкой и корректное завершение запросов при SIGTERM.
 </details>
 
 ### Задача 22. ConfigMap, Secret и обновление конфигурации
@@ -3164,7 +3499,7 @@ kubectl autoscale deploy php --cpu-percent=50 --min=1 --max=10
 kubectl run load --rm -it --image=busybox -- sh -c "while true; do wget -q -O- http://php; done"
 kubectl get hpa -w
 ```
-Без `requests.cpu` HPA по CPU не работает (процент считается от requests).
+HPA по CPU utilization считает процент от `requests.cpu`; если нужные requests не заданы, метрика не может быть рассчитана для такого Pod. `--kubelet-insecure-tls` выше допустим только для изолированного учебного kind; в рабочем кластере настрой доверенные сертификаты.
 </details>
 
 ### Задача 24. NetworkPolicy: default deny
@@ -3196,7 +3531,7 @@ spec:
 </details>
 
 ### Задача 25. RBAC для CI-бота
-ServiceAccount `deployer` в namespace `staging` должен уметь обновлять Deployment'ы и смотреть поды, но не читать Secret'ы.
+ServiceAccount `deployer` в namespace `staging` должен уметь обновлять Deployment'ы и смотреть поды, но не иметь прямого права чтения Secret через API.
 
 <details><summary>▶️ Решение</summary>
 
@@ -3227,6 +3562,8 @@ kubectl auth can-i patch deploy -n staging --as=system:serviceaccount:staging:de
 kubectl auth can-i get secrets -n staging --as=system:serviceaccount:staging:deployer   # no
 kubectl create token deployer -n staging --duration=1h                                   # короткоживущий токен
 ```
+
+**Граница защиты:** отсутствие `get secrets` не изолирует значения секретов от пользователя, способного менять Pod template. Он может добавить Secret в volume/env и вывести его через приложение. Нужны отдельные границы доверия, ограничение допустимых workload-изменений и ServiceAccount через admission policies. Один `kubectl auth can-i get secrets = no` такой защиты не доказывает. [RBAC good practices](https://kubernetes.io/docs/concepts/security/rbac-good-practices/).
 </details>
 
 ---
@@ -3245,7 +3582,7 @@ name: ci
 on:
   push: { branches: [main] }
   pull_request:
-concurrency: { group: ci-${{ github.ref }}, cancel-in-progress: false }
+concurrency: { group: "ci-${{ github.ref }}", cancel-in-progress: false }
 permissions: { contents: read }
 
 jobs:
@@ -3273,7 +3610,7 @@ jobs:
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        with: { registry: ghcr.io, username: ${{ github.actor }}, password: ${{ secrets.GITHUB_TOKEN }} }
+        with: { registry: ghcr.io, username: "${{ github.actor }}", password: "${{ secrets.GITHUB_TOKEN }}" }
       - uses: docker/build-push-action@v6
         with:
           load: true
@@ -3294,7 +3631,7 @@ jobs:
       IMAGE_TAG: ${{ needs.build.outputs.tag }}
     steps:
       - uses: actions/checkout@v4
-        with: { repository: my-org/gitops, token: ${{ secrets.GITOPS_TOKEN }} }
+        with: { repository: my-org/gitops, token: "${{ secrets.GITOPS_TOKEN }}" }
       - name: Check YAML editor
         run: yq --version | grep -F 'mikefarah/yq'
       - run: |
@@ -3619,21 +3956,21 @@ groups:
 # 2
 (1 - node_filesystem_avail_bytes{mountpoint="/"} / node_filesystem_size_bytes{mountpoint="/"}) * 100
 # 3
-sum by (service) (rate(http_requests_total[5m]))
+sum by (job) (rate(http_requests_total[5m]))
 # 4
-sum(rate(http_requests_total{code=~"5.."}[5m])) / sum(rate(http_requests_total[5m]))
+sum(rate(http_requests_total{status=~"5.."}[5m])) / sum(rate(http_requests_total[5m]))
 # 5
-histogram_quantile(0.95, sum by (le, handler) (rate(http_request_duration_seconds_bucket[5m])))
+histogram_quantile(0.95, sum by (le, route) (rate(http_request_duration_seconds_bucket[5m])))
 # 6
 increase(kube_pod_container_status_restarts_total[1h]) > 0
 # 7
-sum by (pod) (rate(container_cpu_cfs_throttled_periods_total[5m]))
-  / sum by (pod) (rate(container_cpu_cfs_periods_total[5m])) > 0.25
+sum by (namespace, pod) (rate(container_cpu_cfs_throttled_periods_total{container!=""}[5m]))
+  / sum by (namespace, pod) (rate(container_cpu_cfs_periods_total{container!=""}[5m])) > 0.25
 # 8
-sum by (pod) (container_memory_working_set_bytes{container!=""})
-  / sum by (pod) (kube_pod_container_resource_limits{resource="memory"})
+sum by (namespace, pod) (container_memory_working_set_bytes{container!="",container!="POD"})
+  / (sum by (namespace, pod) (kube_pod_container_resource_limits{resource="memory"}) > 0)
 ```
-`working_set_bytes` — то, на что смотрит OOM killer, а не `usage_bytes` (включает кэш).
+`working_set_bytes` полезен для наблюдения, но не является единственным критерием OOM. Проверяй лимит cgroup, события OOM и состав памяти; сам по себе этот график не доказывает причину завершения контейнера.
 </details>
 
 ### Задача 35. SLO-алерт по burn rate
@@ -3646,13 +3983,13 @@ groups:
   - name: slo-api
     rules:
       - record: slo:error_ratio:rate5m
-        expr: sum(rate(http_requests_total{job="api",code=~"5.."}[5m])) / sum(rate(http_requests_total{job="api"}[5m]))
+        expr: sum(rate(http_requests_total{job="api",status=~"5.."}[5m])) / sum(rate(http_requests_total{job="api"}[5m]))
       - record: slo:error_ratio:rate1h
-        expr: sum(rate(http_requests_total{job="api",code=~"5.."}[1h])) / sum(rate(http_requests_total{job="api"}[1h]))
+        expr: sum(rate(http_requests_total{job="api",status=~"5.."}[1h])) / sum(rate(http_requests_total{job="api"}[1h]))
       - record: slo:error_ratio:rate30m
-        expr: sum(rate(http_requests_total{job="api",code=~"5.."}[30m])) / sum(rate(http_requests_total{job="api"}[30m]))
+        expr: sum(rate(http_requests_total{job="api",status=~"5.."}[30m])) / sum(rate(http_requests_total{job="api"}[30m]))
       - record: slo:error_ratio:rate6h
-        expr: sum(rate(http_requests_total{job="api",code=~"5.."}[6h])) / sum(rate(http_requests_total{job="api"}[6h]))
+        expr: sum(rate(http_requests_total{job="api",status=~"5.."}[6h])) / sum(rate(http_requests_total{job="api"}[6h]))
 
       - alert: ApiErrorBudgetFastBurn     # 2% бюджета за 1 час
         expr: slo:error_ratio:rate1h > (14.4 * 0.001) and slo:error_ratio:rate5m > (14.4 * 0.001)
@@ -3753,7 +4090,7 @@ log "Готово: $FILE ($(du -h "$FILE" | cut -f1))"
 </details>
 
 ### Задача 38. Python: отчёт о проблемных подах
-Выведи все поды, которые не Running/Succeeded или рестартовали больше 3 раз, с причиной, в виде таблицы.
+Выведи поды с фазой вне Running/Succeeded, Running без Ready, ожидающими контейнерами или контейнером с более чем 3 рестартами. Не пропусти init containers и Pending без container status.
 
 <details><summary>▶️ Решение</summary>
 
@@ -3767,20 +4104,32 @@ v1 = client.CoreV1Api()
 
 rows = []
 for p in v1.list_pod_for_all_namespaces().items:
-    for cs in p.status.container_statuses or []:
-        reason = ""
-        if cs.state.waiting:
-            reason = cs.state.waiting.reason
-        elif cs.last_state.terminated:
-            reason = f"last: {cs.last_state.terminated.reason}"
-        if p.status.phase not in ("Running", "Succeeded") or cs.restart_count > 3 or (cs.state.waiting and reason):
-            rows.append((p.metadata.namespace, p.metadata.name, p.status.phase, cs.restart_count, reason))
+    statuses = ((p.status.init_container_statuses or [])
+                + (p.status.container_statuses or []))
+    conditions = p.status.conditions or []
+    ready = any(c.type == "Ready" and c.status == "True" for c in conditions)
+    restarts = max((cs.restart_count or 0 for cs in statuses), default=0)
+    reasons = []
+    waiting = False
+    for cs in statuses:
+        if cs.state and cs.state.waiting:
+            waiting = True
+            reasons.append(f"{cs.name}: {cs.state.waiting.reason}")
+        elif cs.last_state and cs.last_state.terminated and cs.restart_count:
+            reasons.append(f"{cs.name}: last {cs.last_state.terminated.reason}")
+    bad_phase = p.status.phase not in ("Running", "Succeeded")
+    not_ready = p.status.phase == "Running" and not ready
+    if bad_phase or not_ready or waiting or restarts > 3:
+        reasons.extend(c.reason for c in conditions if c.status == "False" and c.reason)
+        reason = "; ".join(reasons) or p.status.reason or "нет готового контейнера"
+        rows.append((p.metadata.namespace, p.metadata.name,
+                     p.status.phase, restarts, reason))
 
-print(f"{'NAMESPACE':<15}{'POD':<45}{'PHASE':<10}{'RESTARTS':<10}REASON")
+print(f"{'NAMESPACE':<15}{'POD':<45}{'PHASE':<10}{'MAX_RESTARTS':<14}REASON")
 for r in sorted(rows, key=lambda r: -r[3]):
-    print(f"{r[0]:<15}{r[1]:<45}{r[2]:<10}{r[3]:<10}{r[4]}")
+    print(f"{r[0]:<15}{r[1]:<45}{r[2]:<10}{r[3]:<14}{r[4]}")
 ```
-Улучшения: аргументы через `argparse`, вывод в JSON, отправка в Telegram/Slack, запуск как CronJob с ServiceAccount только на `list pods`.
+Проверка на фикстурах: Ready Pod не выводится; Pending без статусов, init CrashLoopBackOff и Running/NotReady выводятся; завершившийся Job без проблем не выводится. `MAX_RESTARTS` — максимальное число рестартов одного контейнера, не число за последний час. Улучшения: `argparse`, JSON, pagination API, CronJob с минимальными правами `list pods`.
 </details>
 
 ---
@@ -4238,6 +4587,8 @@ spec:
 ### ✅ Чек-лист готовности к практике
 
 - [ ] Решил все 55 задач руками хотя бы один раз
+- [ ] Восстановил PostgreSQL в отдельную БД и проверил содержимое (модуль 16)
+- [ ] Проверил срабатывание и завершение алерта, отличаю тест правила от проверки доставки
 - [ ] Прошёл блоки «🏋️ Практика модуля» во всех модулях 01–13
 - [ ] Могу за 10 минут написать Deployment + Service + Ingress с probes и ресурсами по памяти
 - [ ] Могу за 10 минут написать multi-stage Dockerfile
@@ -4299,7 +4650,7 @@ spec:
 - QoS: Guaranteed / Burstable / BestEffort. Memory > limit → OOMKilled; CPU > limit → throttling.
 - Отладка: `describe` → `logs --previous` → `get events` → `exec`/`debug`.
 - Pending → ресурсы/taints/affinity/PVC. ImagePullBackOff → образ/секрет. CrashLoop → логи.
-- Zero downtime: readiness + `maxUnavailable: 0` + preStop sleep + graceful shutdown + PDB.
+- Rolling update: readiness + `maxUnavailable: 0` + запас ресурсов + graceful shutdown; проверять запросами под нагрузкой. PDB отдельно ограничивает eviction при обслуживании нод.
 - Secret = base64, не шифрование → ESO/Vault/SOPS + шифрование etcd.
 - Ingress → Gateway API. Автоскейл: HPA, VPA, KEDA, Cluster Autoscaler/Karpenter.
 
@@ -4308,7 +4659,7 @@ spec:
 - Build once, deploy many. OIDC вместо статических ключей. Pin actions по SHA.
 - Rolling / Recreate / Blue-Green / Canary / Feature flags.
 - GitOps: Git = источник истины, pull, reconcile (Argo CD, Flux).
-- DORA: deploy frequency, lead time, change failure rate, MTTR.
+- DORA: deployment frequency, change lead time, failed deployment recovery time, change fail rate, deployment rework rate.
 - Миграции БД: expand → migrate → contract.
 
 ## Terraform / Ansible
@@ -4404,7 +4755,7 @@ STAR. 3 истории: инцидент, автоматизация, ошибк
 <details><summary>31. 🟢 L4 vs L7 балансировщик?</summary>L4 — по IP/порту (TCP/UDP); L7 — видит HTTP: путь, заголовки, cookie, TLS termination.</details>
 <details><summary>32. 🟢 Что такое NAT?</summary>Трансляция адресов: SNAT — приватные хосты выходят в интернет; DNAT — проброс портов внутрь.</details>
 <details><summary>33. 🟢 Сколько адресов в /26?</summary>64 (62 хоста).</details>
-<details><summary>34. 🟡 Что такое MTU и проблемы с ним?</summary>Максимальный размер кадра. В туннелях (VXLAN, VPN) — фрагментация/дроп: ping проходит, большие пакеты (TLS) виснут.</details>
+<details><summary>34. 🟡 Что такое MTU и проблемы с ним?</summary>Максимальный размер IP-пакета на интерфейсе без фрагментации. В туннелях (VXLAN, VPN) — фрагментация/дроп: ping проходит, большие пакеты (TLS) виснут.</details>
 <details><summary>35. 🟡 Что такое anycast?</summary>Один IP анонсируется из многих точек по BGP — трафик идёт к ближайшей (CDN, публичные DNS).</details>
 <details><summary>36. 🟢 Что происходит при вводе URL в браузер?</summary>URL → DNS → TCP/QUIC → TLS → HTTP → CDN/LB → приложение → ответ → рендер.</details>
 <details><summary>37. 🟡 Что такое CDN и как инвалидировать кэш?</summary>Сеть edge-кэшей. Инвалидация через API/purge или версионирование имён файлов (хеш в имени).</details>
@@ -4462,8 +4813,8 @@ STAR. 3 истории: инцидент, автоматизация, ошибк
 <details><summary>80. 🟡 HPA vs VPA vs KEDA?</summary>HPA — число реплик по метрикам; VPA — requests; KEDA — по внешним событиям, scale-to-zero.</details>
 <details><summary>81. 🟡 Cluster Autoscaler vs Karpenter?</summary>CA масштабирует группы нод; Karpenter подбирает тип инстанса под pending-поды напрямую, быстрее, консолидирует.</details>
 <details><summary>82. 🟡 Почему Secret небезопасен?</summary>base64, хранится в etcd открыто без encryption at rest; доступен всем с правом get secrets.</details>
-<details><summary>83. 🟡 Ingress vs Gateway API?</summary>Gateway API — новый стандарт: разделение ролей, L4/L7, gRPC, богаче маршрутизация, переносимость; ingress-nginx уходит из поддержки.</details>
-<details><summary>84. 🟡 Как сделать zero-downtime деплой?</summary>readiness, maxUnavailable 0, preStop sleep, обработка SIGTERM, PDB, достаточный terminationGracePeriod.</details>
+<details><summary>83. 🟡 Ingress vs Gateway API?</summary>Gateway API — новый стандарт: разделение ролей, L4/L7, gRPC, богаче маршрутизация, переносимость; поддержка community ingress-nginx завершилась в марте 2026 года.</details>
+<details><summary>84. 🟡 Как сделать zero-downtime деплой?</summary>readiness, maxUnavailable 0, запас ресурсов, обработка SIGTERM и достаточный terminationGracePeriod; подтвердить под нагрузкой. PDB ограничивает eviction, не rollout.</details>
 <details><summary>85. 🟡 Helm vs Kustomize?</summary>Helm — шаблоны + релизы + пакеты; Kustomize — патчи и overlays без шаблонов.</details>
 <details><summary>86. 🟡 Что такое оператор?</summary>CRD + контроллер, автоматизирующий эксплуатацию сложного ПО (бэкапы, failover).</details>
 <details><summary>87. 🟡 RBAC в K8s?</summary>Role/ClusterRole (права) + RoleBinding/ClusterRoleBinding (к пользователю/группе/ServiceAccount).</details>
@@ -4482,7 +4833,7 @@ STAR. 3 истории: инцидент, автоматизация, ошибк
 <details><summary>97. 🟡 Push vs pull деплой?</summary>Push — CI ходит в кластер (нужны креды в CI); pull — кластер тянет из Git (безопаснее, видит drift).</details>
 <details><summary>98. 🟡 Как хранить секреты в CI?</summary>Masked/protected vars, OIDC к облаку, Vault, никогда в репо и логах.</details>
 <details><summary>99. 🟡 Миграции БД без даунтайма?</summary>Expand/contract: обратно-совместимая схема → новый код → удаление старого.</details>
-<details><summary>100. 🟡 DORA-метрики?</summary>Deployment frequency, Lead time, Change failure rate, Time to restore.</details>
+<details><summary>100. 🟡 DORA-метрики?</summary>Deployment frequency, Change lead time, Failed deployment recovery time, Change fail rate, Deployment rework rate.</details>
 <details><summary>101. 🟡 Feature flags — зачем?</summary>Разделить деплой и релиз, быстро выключить фичу, A/B, canary для пользователей.</details>
 <details><summary>102. 🔴 Как защитить CI/CD от supply-chain атак?</summary>Pin по SHA, минимальные права токенов, OIDC, изолированные runner'ы, подпись артефактов, SBOM, review изменений пайплайна.</details>
 
@@ -4493,7 +4844,7 @@ STAR. 3 истории: инцидент, автоматизация, ошибк
 <details><summary>105. 🟡 Зачем state locking?</summary>Чтобы два apply не изменили инфраструктуру одновременно и не повредили state.</details>
 <details><summary>106. 🟡 count vs for_each?</summary>count — по индексу, сдвиг индексов пересоздаёт ресурсы; for_each — по ключу, стабильнее.</details>
 <details><summary>107. 🟡 Как импортировать ресурс?</summary>Блок `import { to = ..., id = ... }` + plan (или `terraform import`).</details>
-<details><summary>108. 🟡 Как переименовать ресурс без пересоздания?</summary>Блок `moved { from = ..., to = ... }` или `terraform state mv`.</details>
+<details><summary>108. 🟡 Как переименовать ресурс без пересоздания?</summary>Блок `moved` с полями `from` и `to` на отдельных строках или `terraform state mv`.</details>
 <details><summary>109. 🟡 Что такое drift?</summary>Расхождение реальности и кода из-за ручных изменений. Выявлять регулярным plan.</details>
 <details><summary>110. 🟡 Terraform vs OpenTofu?</summary>OpenTofu — open-source (MPL) форк после перехода Terraform на BSL; совместим, есть шифрование state.</details>
 <details><summary>111. 🟡 Как организовать окружения?</summary>Отдельные стейты/каталоги (или Terragrunt), общие модули, разные креды и аккаунты.</details>
