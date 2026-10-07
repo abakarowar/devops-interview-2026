@@ -1,7 +1,7 @@
 # 🚀 DevOps Interview 2026 — шпаргалка-курс для подготовки к собеседованию
 
-> Всё, что спрашивают на собеседованиях DevOps / SRE / Platform Engineer в 2026 году — в одном репозитории.
-> Короткая теория, команды, типовые вопросы с ответами, задачи live-coding и «ловушки» интервьюеров.  🖥 [Самая большая коллекция информации для собесов и практик  DevOps специалиста лежит здесь](https://t.me/+7HWlD5t-Zqw2YjMy) | Сложные концепции DevOps на
+> Основные темы для подготовки к собеседованиям DevOps / SRE / Platform Engineer.
+> Короткая теория, команды, типовые вопросы с ответами, задачи live-coding и разбор эксплуатационных проблем.
 
 ![level](https://img.shields.io/badge/level-Junior%20→%20Senior-blue)
 ![lang](https://img.shields.io/badge/язык-русский-red)
@@ -32,6 +32,8 @@
 - [13. System Design для DevOps](#m13)
 - [14. Практика: troubleshooting-кейсы и live-coding](#m14)
 - [15. Soft skills, HR и переговоры](#m15)
+- [16. PostgreSQL, Redis и очереди в эксплуатации](#m16)
+- [Как запускать практику и проверять результат](#lab-guide)
 - [🏋️ Практикум: 55 задач с решениями](#practice)
 - [⚡ DevOps-шпаргалка на одной странице](#cheatsheet)
 - [❓ 150 вопросов с собеседований DevOps 2026](#questions)
@@ -46,10 +48,12 @@
 - **OpenTelemetry** — стандарт де-факто для трейсов/метрик/логов.
 - **Supply chain security**: SBOM, подписи образов (cosign/Sigstore), SLSA.
 - **eBPF** (Cilium, Tetragon, Pixie) — в вопросах про сеть и observability в K8s.
-- **Gateway API** постепенно вытесняет Ingress; ingress-nginx объявлен к выводу из поддержки.
+- **Gateway API**: изучай маршрутизацию и миграцию с ingress-nginx, поддержка которого завершилась в марте 2026 года. Сам API Ingress этим не отменён.
 - **AI в работе DevOps**: как используешь LLM-ассистентов, где им нельзя доверять, MLOps/GPU-ноды в K8s.
 - **FinOps**: «как сократить счёт за облако на 30%» — популярный кейс.
 - Для РФ-рынка: **Yandex Cloud, VK Cloud, Deckhouse, GitLab self-hosted**, импортозамещение.
+
+Проверено по документации 8 октября 2026 года: [завершение поддержки ingress-nginx](https://kubernetes.io/blog/2026/01/29/ingress-nginx-statement/), [Promtail EOL](https://grafana.com/docs/loki/latest/send-data/promtail/), [пять метрик DORA](https://dora.dev/guides/dora-metrics/). Версии инструментов в примерах фиксируют учебный контекст и не означают, что это последние или рекомендуемые для production версии.
 
 
 ---
@@ -653,7 +657,7 @@ git push --force-with-lease   # если ветка уже была запуше
 - **OCI** — стандарты образа и рантайма.
 - **containerd** — высокоуровневый рантайм (используется K8s). **runc** — низкоуровневый.
 - **dockershim** удалён из K8s в 1.24 — K8s работает с containerd/CRI-O напрямую; образы Docker при этом совместимы.
-- Альтернативы: Podman (daemonless, rootless), Buildah, BuildKit, kaniko (сборка в K8s без Docker daemon).
+- Альтернативы: Podman (daemonless, rootless), Buildah, BuildKit. Оригинальный [GoogleContainerTools/kaniko](https://github.com/GoogleContainerTools/kaniko) архивирован 3 июня 2025 года и больше не поддерживается; учитывай это при разборе старых пайплайнов.
 
 ## Образ и слои
 - Каждая инструкция `RUN/COPY/ADD` → слой. Слои кэшируются **сверху вниз**: изменение слоя инвалидирует все ниже.
@@ -865,7 +869,7 @@ resources:
   requests: { cpu: "250m", memory: "256Mi" }   # для планировщика
   limits:   { memory: "256Mi" }                # потолок
 ```
-- **Guaranteed** — requests = limits для всех; **Burstable** — requests < limits; **BestEffort** — ничего. При нехватке памяти выселяются первыми BestEffort.
+- Для обычных ресурсов контейнеров: **Guaranteed** — у каждого контейнера заданы CPU и memory requests/limits, попарно равные; **BestEffort** — ни CPU, ни memory requests/limits не заданы; **Burstable** — остальные случаи. Пример выше — Burstable. При node-pressure eviction учитываются превышение requests, Priority и потребление; QoS не задаёт безусловную очередь выселения.
 - Превышение лимита памяти → **OOMKilled**. Превышение CPU → **throttling** (не убивает).
 - Тренд: ставить memory limit = request, CPU limit часто не ставить (избегать throttling).
 - С 1.33+ — **in-place resize** ресурсов пода без рестарта (beta→GA).
@@ -899,7 +903,7 @@ kubectl auth can-i delete pods --as=system:serviceaccount:dev:ci -n dev
 
 ## Сеть
 - Каждый под — свой IP, все поды видят друг друга без NAT (модель K8s).
-- Ingress-контроллеры: ingress-nginx (в 2025 объявлен retirement — переход на Gateway API: Envoy Gateway, Cilium, Istio, NGINX Gateway Fabric, Traefik).
+- Поддержка community ingress-nginx завершилась в марте 2026 года. Планируй миграцию на поддерживаемый контроллер: Gateway API (например, Envoy Gateway) или другой Ingress-контроллер. Ingress API и другие продукты с NGINX в названии — отдельные проекты.
 - **Gateway API**: `GatewayClass` → `Gateway` → `HTTPRoute/GRPCRoute`, разделение ролей инфраструктура/приложение.
 - Service mesh: Istio (в т.ч. ambient mode без sidecar), Linkerd, Cilium.
 
@@ -1095,19 +1099,21 @@ deploy_prod:
     - helm upgrade --install app ./chart --set image.tag=$CI_COMMIT_SHORT_SHA --atomic --wait
 ```
 
-## Пример: GitHub Actions с OIDC
+## Пример: GitHub Actions с GITHUB_TOKEN
 
 ```yaml
 name: ci
 on: { push: { branches: [main] }, pull_request: {} }
-permissions: { contents: read, id-token: write, packages: write }
+permissions: { contents: read }
 jobs:
   build:
     runs-on: ubuntu-latest
+    permissions: { contents: read, packages: write }
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         with: { registry: ghcr.io, username: ${{ github.actor }}, password: ${{ secrets.GITHUB_TOKEN }} }
       - uses: docker/build-push-action@v6
         with:
@@ -1117,7 +1123,7 @@ jobs:
           cache-to: type=gha,mode=max
 ```
 
-> 💡 **OIDC** вместо долгоживущих ключей: CI получает короткоживущий токен в облаке (AWS/GCP/Yandex) по доверию к issuer'у.
+> 💡 Этот пример публикует в GHCR через `GITHUB_TOKEN`. Настоящий обмен OIDC-токена на временные AWS credentials показан в задаче №45. Само разрешение `id-token: write` такой обмен не выполняет.
 > 💡 Пиньте actions по SHA (`uses: actions/checkout@<sha>`) — защита от supply chain атак (кейс tj-actions/changed-files, 2025).
 
 ## Стратегии деплоя
@@ -1146,11 +1152,13 @@ jobs:
 - Отдельные runner'ы для прода, минимальные права.
 
 ## Метрики DORA
-1. **Deployment frequency**
-2. **Lead time for changes**
-3. **Change failure rate**
-4. **Time to restore service** (MTTR)
-(+ Reliability как 5-я в новых отчётах.)
+1. **Deployment frequency** — частота выкладок.
+2. **Change lead time** — время от коммита до production.
+3. **Failed deployment recovery time** — восстановление после неудачной выкладки; не общий MTTR всех инцидентов.
+4. **Change fail rate** — доля выкладок, требующих немедленного вмешательства.
+5. **Deployment rework rate** — доля незапланированных выкладок из-за инцидентов в production.
+
+Сравнивай динамику одного сервиса с учётом его контекста. Метрики не предназначены для рейтинга отдельных инженеров. [Актуальные определения DORA](https://dora.dev/guides/dora-metrics/).
 
 ## ❓ Вопросы
 1. CI vs Continuous Delivery vs Deployment?
@@ -1659,7 +1667,7 @@ groups:
 ## Логи
 - Структурированные (JSON), с `trace_id`, уровнем, сервисом.
 - Стеки: **ELK/EFK** (Elasticsearch/OpenSearch), **Loki** (индексирует только лейблы — дёшево), ClickHouse-based (SigNoz, Uptrace), VictoriaLogs.
-- Сборщики: Fluent Bit, Vector, Promtail → **Grafana Alloy** (Promtail в 2025 объявлен deprecated), OTel Collector.
+- Сборщики: Fluent Bit, Vector, **Grafana Alloy**, OTel Collector. Поддержка Promtail завершилась 2 марта 2026 года; для существующих установок нужна миграция на поддерживаемый сборщик.
 - В K8s: приложение пишет в stdout → DaemonSet-агент читает `/var/log/containers`.
 
 ## Трейсы
@@ -2297,7 +2305,9 @@ for i in 1 2 3 4 5; do
 done
 kubectl logs load | grep -A5 'Status code distribution'
 ```
-Если видишь ошибки — добавь readinessProbe, `preStop: sleep 5`, PDB и graceful shutdown, повтори и сравни.
+Если видишь ошибки — проверь readinessProbe, обработку SIGTERM, завершение текущих запросов и задержку распространения изменений endpoints. `preStop` выполняется внутри общего termination grace period; подбирай задержку по наблюдениям, а не как универсальную константу.
+
+**PDB не блокирует прямой `kubectl delete pod` и не управляет rolling update Deployment.** Он ограничивает выселения через Eviction API, например при `kubectl drain`. Для обновления Deployment настрой `maxUnavailable`/`maxSurge`, для обслуживания нод — PDB. [Disruptions](https://kubernetes.io/docs/concepts/workloads/pods/disruptions/).
 </details>
 
 🔗 Больше задач: [Практикум №50–52](#p-sre) — SLO и error budget policy, runbook, game day.
@@ -3235,8 +3245,8 @@ name: ci
 on:
   push: { branches: [main] }
   pull_request:
-concurrency: { group: ci-${{ github.ref }}, cancel-in-progress: true }
-permissions: { contents: read, packages: write }
+concurrency: { group: ci-${{ github.ref }}, cancel-in-progress: false }
+permissions: { contents: read }
 
 jobs:
   test:
@@ -3250,13 +3260,19 @@ jobs:
   build:
     needs: test
     runs-on: ubuntu-latest
-    outputs: { image: ${{ steps.meta.outputs.image }} }
+    permissions: { contents: read, packages: write }
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+      tag: ${{ steps.meta.outputs.tag }}
     steps:
       - uses: actions/checkout@v4
       - id: meta
-        run: echo "image=ghcr.io/${GITHUB_REPOSITORY,,}:${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+        run: |
+          echo "image=ghcr.io/${GITHUB_REPOSITORY,,}:${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+          echo "tag=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         with: { registry: ghcr.io, username: ${{ github.actor }}, password: ${{ secrets.GITHUB_TOKEN }} }
       - uses: docker/build-push-action@v6
         with:
@@ -3264,25 +3280,34 @@ jobs:
           tags: ${{ steps.meta.outputs.image }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-      - uses: aquasecurity/trivy-action@master
+      - uses: aquasecurity/trivy-action@0.28.0
         with: { image-ref: "${{ steps.meta.outputs.image }}", severity: "CRITICAL,HIGH", exit-code: "1", ignore-unfixed: true }
       - if: github.ref == 'refs/heads/main'
         run: docker push ${{ steps.meta.outputs.image }}
 
   deploy:
-    if: github.ref == 'refs/heads/main'
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     needs: build
     runs-on: ubuntu-latest
     environment: production
+    env:
+      IMAGE_TAG: ${{ needs.build.outputs.tag }}
     steps:
       - uses: actions/checkout@v4
         with: { repository: my-org/gitops, token: ${{ secrets.GITOPS_TOKEN }} }
+      - name: Check YAML editor
+        run: yq --version | grep -F 'mikefarah/yq'
       - run: |
-          yq -i '.image.tag = "${{ github.sha }}"' apps/api/values-prod.yaml
+          yq -i '.image.tag = strenv(IMAGE_TAG)' apps/api/values-prod.yaml
           git config user.name ci-bot && git config user.email ci@example.com
-          git commit -am "api: deploy ${GITHUB_SHA::7}" && git push
+          git add apps/api/values-prod.yaml
+          if ! git diff --cached --quiet; then
+            git commit -m "api: deploy ${IMAGE_TAG}" && git push
+          fi
 ```
-На собеседовании объясни: `concurrency` отменяет устаревшие запуски, `environment` даёт ручной approve, Argo CD сам подтянет изменение из gitops-репо. В проде пинни actions по SHA.
+Предпосылки: `my-org/gitops` заменён на свой репозиторий; в нём есть Helm chart и `apps/api/values-prod.yaml`; `image.repository` совпадает с публикуемым образом; runner содержит Mike Farah `yq` v4. `GITOPS_TOKEN` имеет право записи только в нужный репозиторий. Это шаблон интеграции, не автономный стенд.
+
+Сборка и деплой используют **один полный SHA**, переданный через job outputs. Для production предпочтителен digest. `concurrency` здесь не прерывает уже работающий деплой, но не гарантирует FIFO; отдельно проверяй, не устарел ли релиз. Ручное подтверждение появляется только после настройки required reviewers для environment `production`, а не от одного поля `environment`. Для PR из форков доступны ограниченные права; публикация и деплой выполняются только на push в main. В production пинни actions по проверенному полному commit SHA.
 </details>
 
 ### Задача 27. GitLab CI: шаблоны и окружения
@@ -3363,7 +3388,12 @@ spec:
 # modules/vpc/variables.tf
 variable "name" { type = string }
 variable "cidr" { type = string }
-variable "azs"  { type = list(string) }
+variable "subnets" {
+  type = map(object({
+    private_cidr = string
+    public_cidr  = string
+  }))
+}
 
 # modules/vpc/main.tf
 resource "aws_vpc" "this" {
@@ -3373,20 +3403,40 @@ resource "aws_vpc" "this" {
 }
 
 resource "aws_subnet" "private" {
-  for_each          = { for i, az in var.azs : az => i }
+  for_each          = var.subnets
   vpc_id            = aws_vpc.this.id
   availability_zone = each.key
-  cidr_block        = cidrsubnet(var.cidr, 4, each.value)
+  cidr_block        = each.value.private_cidr
   tags              = { Name = "${var.name}-private-${each.key}" }
 }
 
 resource "aws_subnet" "public" {
-  for_each                = { for i, az in var.azs : az => i }
+  for_each                = var.subnets
   vpc_id                  = aws_vpc.this.id
   availability_zone       = each.key
-  cidr_block              = cidrsubnet(var.cidr, 8, 48 + each.value)
+  cidr_block              = each.value.public_cidr
   map_public_ip_on_launch = true
   tags                    = { Name = "${var.name}-public-${each.key}" }
+}
+
+resource "aws_internet_gateway" "this" {
+  vpc_id = aws_vpc.this.id
+}
+
+resource "aws_route_table" "public" {
+  vpc_id = aws_vpc.this.id
+}
+
+resource "aws_route" "internet" {
+  route_table_id         = aws_route_table.public.id
+  destination_cidr_block = "0.0.0.0/0"
+  gateway_id            = aws_internet_gateway.this.id
+}
+
+resource "aws_route_table_association" "public" {
+  for_each       = aws_subnet.public
+  subnet_id      = each.value.id
+  route_table_id = aws_route_table.public.id
 }
 
 # modules/vpc/outputs.tf
@@ -3397,10 +3447,16 @@ module "vpc" {
   source = "../../modules/vpc"
   name   = "prod"
   cidr   = "10.10.0.0/16"
-  azs    = ["eu-central-1a", "eu-central-1b", "eu-central-1c"]
+  subnets = {
+    eu-central-1a = { private_cidr = "10.10.0.0/20", public_cidr = "10.10.48.0/24" }
+    eu-central-1b = { private_cidr = "10.10.16.0/20", public_cidr = "10.10.49.0/24" }
+    eu-central-1c = { private_cidr = "10.10.32.0/20", public_cidr = "10.10.50.0/24" }
+  }
 }
 ```
-Почему `for_each` по зоне: удаление зоны из списка не пересоздаст остальные подсети (с `count` индексы бы сдвинулись).
+Зона служит стабильным ключом, CIDR задан явно и не зависит от позиции в списке. Удаление `eu-central-1b` не меняет CIDR оставшихся подсетей. Сам `for_each` не спасает от replacement, если адрес всё ещё вычисляется через изменяющийся индекс.
+
+Публичность задаёт маршрут через Internet Gateway, а не только `map_public_ip_on_launch`. Приватные подсети этого примера не имеют выхода в интернет: NAT Gateway или endpoints добавляются отдельно. В корневом модуле нужны AWS provider с регионом `eu-central-1` и credentials; перед apply проверь отсутствие пересечений CIDR и plan.
 </details>
 
 ### Задача 30. Рефакторинг без пересоздания и импорт
@@ -3642,7 +3698,7 @@ awk '{t++} $9 ~ /^5/ {e++} END {printf "5xx: %.2f%%\n", e/t*100}' access.log
 ```
 </details>
 
-### Задача 37. Скрипт бэкапа PostgreSQL с ротацией и проверкой
+### Задача 37. Скрипт бэкапа PostgreSQL с ротацией и проверкой архива
 <details><summary>▶️ Решение</summary>
 
 ```bash
@@ -3652,28 +3708,48 @@ set -Eeuo pipefail
 DB=${DB:-app}
 DIR=${BACKUP_DIR:-/backup}
 KEEP=${KEEP:-7}
-TS=$(date +%F_%H%M)
+BACKUP_S3_URI=${BACKUP_S3_URI:?set BACKUP_S3_URI to your backup prefix}
+[[ $DB =~ ^[a-zA-Z0-9_]+$ ]] || { echo "Недопустимое имя БД" >&2; exit 1; }
+[[ $KEEP =~ ^[1-9][0-9]*$ ]] || { echo "KEEP должен быть положительным целым" >&2; exit 1; }
+TS=$(date -u +%Y%m%dT%H%M%S)_$$
 FILE="$DIR/${DB}_${TS}.sql.gz"
 
 log() { echo "$(date -Is) $*"; }
-trap 'log "ОШИБКА на строке $LINENO"; rm -f "$FILE"; exit 1' ERR
-
-exec 9>/run/pg-backup.lock
-flock -n 9 || { log "Бэкап уже идёт"; exit 0; }
+PARTIAL=""
+cleanup() { if [[ -n $PARTIAL ]]; then rm -f -- "$PARTIAL"; fi; }
+trap cleanup EXIT
+trap 'log "ОШИБКА на строке $LINENO" >&2' ERR
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 mkdir -p "$DIR"
+exec 9>"$DIR/.pg-backup.lock"
+flock -n 9 || { log "Бэкап уже идёт"; exit 0; }
+
+PARTIAL=$(mktemp "$DIR/.${DB}.partial.XXXXXX")
 log "Старт бэкапа $DB"
-pg_dump --no-owner "$DB" | gzip -9 > "$FILE"
+pg_dump --no-owner --no-acl "$DB" | gzip -9 > "$PARTIAL"
 
-gzip -t "$FILE"                                      # архив не битый
-[[ $(stat -c %s "$FILE") -gt 1024 ]] || { log "Слишком маленький файл"; exit 1; }
+gzip -t "$PARTIAL"                        # проверка gzip, не восстановимости БД
+mv -- "$PARTIAL" "$FILE"                  # готовое имя появляется после завершения
+PARTIAL=""
 
-aws s3 cp "$FILE" "s3://acme-backups/postgres/" --storage-class STANDARD_IA
+aws s3 cp "$FILE" "${BACKUP_S3_URI%/}/"
 
-ls -1t "$DIR"/${DB}_*.sql.gz | tail -n +$((KEEP+1)) | xargs -r rm --
+python3 - "$DIR" "$DB" "$KEEP" <<'PY'
+import sys
+from pathlib import Path
+directory, database, keep = sys.argv[1:]
+backups = sorted(Path(directory).glob(f"{database}_*.sql.gz"),
+                 key=lambda p: p.stat().st_mtime_ns, reverse=True)
+for backup in backups[int(keep):]:
+    backup.unlink()
+PY
 log "Готово: $FILE ($(du -h "$FILE" | cut -f1))"
 ```
-Что сказать на интервью: `pg_dump` подходит для небольших БД; для больших — физические бэкапы и PITR (pgBackRest, WAL-G). Бэкап без регулярного тестового восстановления — не бэкап.
+Предпосылки: Linux, `pg_dump`, `gzip`, `flock`, Python 3 и AWS CLI; доступ к БД через libpq-конфигурацию/`.pgpass`, настроенный S3-префикс. Пароли не записываются в скрипт. При ошибке выгрузки готовая локальная копия сохраняется, ротация не выполняется. Ретенция объектов в S3 настраивается отдельно.
+
+Проверка gzip подтверждает целостность сжатого потока. Для проверки бэкапа нужно восстановить его в отдельную БД с остановкой на SQL-ошибках и выполнить контрольные запросы. Самостоятельная лабораторная — в [модуле 16](#m16). `pg_dump` не заменяет физическую копию и архив WAL для PITR и не сохраняет глобальные роли кластера. Требования к владельцам, ACL и ролям учитывай отдельно.
 </details>
 
 ### Задача 38. Python: отчёт о проблемных подах
@@ -4147,10 +4223,10 @@ spec:
 
 <details><summary>▶️ Каркас ответа</summary>
 
-1. **В каждом кластере:** Prometheus Agent / OTel Collector (сбор, без долгого хранения) + Fluent Bit/Alloy для логов.
+1. **В каждом кластере:** Prometheus Server с локальными правилами и короткой ретенцией + Fluent Bit/Alloy для логов. Prometheus Agent подходит для сбора и remote_write, но не выполняет recording/alerting rules; при выборе Agent нужен отдельный компонент для локальных правил.
 2. **Центр:** remote_write в Mimir/VictoriaMetrics cluster (multi-tenant, tenant = кластер), Loki, Tempo; объектное хранилище для долгого хранения.
 3. **Надёжность:** WAL у агентов на случай недоступности центра; алерты «нет данных от кластера» (`absent`/deadman switch во внешней системе).
-4. **Кардинальность:** лимиты на тенанта, relabeling, recording rules на краю.
+4. **Кардинальность:** лимиты на тенанта, relabeling, recording rules в локальном Prometheus Server.
 5. **Алертинг:** локальные критичные правила оцениваются в кластере (работают при разрыве связи), глобальные — в центре; Alertmanager в HA, маршрутизация по `team`.
 6. **Оценка:** 50 кластеров × 500k серий = 25M активных серий → ~ порядок размера кластера Mimir; стоимость хранения.
 
